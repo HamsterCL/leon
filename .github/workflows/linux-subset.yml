@@ -751,7 +751,27 @@ jobs:
       # the same environment here as under `env -i` locally. A kept variable
       # that is unset becomes empty rather than going missing, which would
       # change what Cargo and rustup do, so only set ones are passed on.
+      # #[ignore] tests never run in the four runs above, nor anywhere else
+      # unless someone asks for them by name, so they rot unseen: a benchmark
+      # that unwraps an API it no longer matches still compiles and still
+      # "passes" by being skipped. The ones that need nothing from outside
+      # the repository (the synthetic benchmarks in IGNORED_HERMETIC) run
+      # here too, once, in the release profile they are written for; their
+      # timings are only printed, so a slow runner cannot fail them. The
+      # rest (IGNORED_EXTERNAL) read game data or reference files named by
+      # environment variables and cannot run here. Every ignored test in the
+      # Linux crates, with and without features, must be on exactly one of
+      # the two lists, so a new one is either run or says why it cannot be,
+      # and a renamed or deleted one cannot leave a stale entry behind.
       - name: cargo test
+        env:
+          IGNORED_HERMETIC: >-
+            bcpack::tests::bcpack_throughput
+            emit::bitcode::tests::bench_write
+          IGNORED_EXTERNAL: >-
+            bcpack::tests::reference_chunks
+            xma::tests::matches_a_reference_decoder
+            xma::tests::walks_saved_streams
         run: |
           userns=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
           if [[ -e "${userns}" && "$(< "${userns}")" != 0 ]]; then
@@ -773,7 +793,8 @@ jobs:
             fi
           done
           offline=(unshare --user --map-current-user --net -- env -i "${keep[@]}")
-          if [[ "$("${offline[@]}" id -u)" != "$(id -u)" ]]; then
+          inner_uid="$("${offline[@]}" id -u)"
+          if [[ "${inner_uid}" != "${UID}" ]]; then
             echo "::error::unshare did not keep the runner's user id" >&2
             exit 1
           fi
@@ -798,6 +819,28 @@ jobs:
           "${offline[@]}" cargo test --locked --no-fail-fast --all-features "${crates[@]}" -- --exact "${skips[@]}"
           "${offline[@]}" cargo test --locked --no-fail-fast --release "${crates[@]}" -- --exact "${skips[@]}"
           "${offline[@]}" cargo test --locked --no-fail-fast --profile diag --all-features "${crates[@]}" -- --exact "${skips[@]}"
+          read -r -a hermetic <<< "${IGNORED_HERMETIC}"
+          read -r -a external <<< "${IGNORED_EXTERNAL}"
+          expected="${RUNNER_TEMP}/ignored-expected"
+          listed="${RUNNER_TEMP}/ignored-listed"
+          printf '%s\n' "${hermetic[@]}" "${external[@]}" | sort > "${expected}"
+          dups="$(uniq -d "${expected}")"
+          if [[ -n "${dups}" ]]; then
+            echo "::error::a test is listed twice in IGNORED_HERMETIC/IGNORED_EXTERNAL" >&2
+            printf '%s\n' "${dups}" >&2
+            exit 1
+          fi
+          for build in --release "--profile diag --all-features"; do
+            read -r -a flags <<< "${build}"
+            "${offline[@]}" cargo test --locked -q "${flags[@]}" "${crates[@]}" -- --list --ignored --format terse > "${listed}.raw"
+            sed -n 's/: test$//p' "${listed}.raw" | sort -u > "${listed}"
+            if ! diff "${listed}" "${expected}" > "${listed}.diff"; then
+              echo "::error::ignored tests (cargo test ${build}) differ from IGNORED_HERMETIC + IGNORED_EXTERNAL (< listed, > expected)" >&2
+              cat "${listed}.diff" >&2
+              exit 1
+            fi
+          done
+          "${offline[@]}" cargo test --locked --no-fail-fast --release "${crates[@]}" -- --exact --ignored "${hermetic[@]}"
           leftovers="$(find "${TMPDIR}" -mindepth 1 -maxdepth 2)"
           if [[ -n "${leftovers}" ]]; then
             echo "::error::cargo test left files in TMPDIR" >&2
