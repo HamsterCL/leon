@@ -106,6 +106,10 @@ enum Command {
         /// Actually start the title. Without it, stop after binding.
         #[arg(long)]
         execute: bool,
+        /// Translate the game's shaders into the cache first, with a
+        /// progress line, so the run finds them there.
+        #[arg(long)]
+        prewarm: bool,
         /// The console model the title sees (device type, memory).
         #[arg(long, value_enum, default_value_t = Console::SeriesX)]
         console: Console,
@@ -168,9 +172,10 @@ fn main() -> Result<()> {
             unimplemented,
             strict,
             execute,
+            prewarm,
             console,
             title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+        } => run::run(&exe, unimplemented, strict, execute, prewarm, console),
         Command::Config => show_config(),
     }
 }
