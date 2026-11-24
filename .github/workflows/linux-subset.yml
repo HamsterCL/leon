@@ -763,6 +763,9 @@ jobs:
       # the same environment here as under `env -i` locally. A kept variable
       # that is unset becomes empty rather than going missing, which would
       # change what Cargo and rustup do, so only set ones are passed on.
+      # LC_ALL=C is kept explicitly (the runner has a UTF-8 LANG, a contributor
+      # may have another): libc collation, character classes and strerror
+      # strings then match a POSIX locale everywhere.
       # All four also run under umask 077, not the runner's 022, so every
       # file and directory a test or build script makes is private to its
       # owner, as on a contributor's machine set up that way (a hardened
@@ -781,9 +784,11 @@ jobs:
       # timings are only printed, so a slow runner cannot fail them. The
       # rest (IGNORED_EXTERNAL) read game data or reference files named by
       # environment variables and cannot run here. Every ignored test in the
-      # Linux crates, with and without features, must be on exactly one of
-      # the two lists, so a new one is either run or says why it cannot be,
-      # and a renamed or deleted one cannot leave a stale entry behind.
+      # Linux crates must be on exactly one of the two lists in all four
+      # build passes above (default, all-features, release, diag), so a
+      # cfg(feature) or profile-only benchmark cannot hide from the lists, a
+      # new one is either run or says why it cannot be, and a renamed or
+      # deleted one cannot leave a stale entry behind.
       - name: cargo test
         env:
           IGNORED_HERMETIC: >-
@@ -808,9 +813,10 @@ jobs:
           unset XDG_CACHE_HOME XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME
           export TMPDIR="${scratch}/tmp"
           mkdir "${TMPDIR}"
+          export LC_ALL=C
           keep=()
           for name in PATH HOME TMPDIR CARGO_HOME RUSTUP_HOME CARGO_NET_OFFLINE \
-            CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE; do
+            CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE LC_ALL; do
             if [[ -v "${name}" ]]; then
               keep+=("${name}=${!name}")
             fi
@@ -858,8 +864,13 @@ jobs:
             printf '%s\n' "${dups}" >&2
             exit 1
           fi
-          for build in --release "--profile diag --all-features"; do
-            read -r -a flags <<< "${build}"
+          for build in default --all-features --release "--profile diag --all-features"; do
+            case "${build}" in
+              default) flags=() ;;
+              --all-features) read -r -a flags <<< "--all-features" ;;
+              --release) read -r -a flags <<< "--release" ;;
+              *) read -r -a flags <<< "${build}" ;;
+            esac
             "${offline[@]}" cargo test --locked -q "${flags[@]}" "${crates[@]}" -- --list --ignored --format terse > "${listed}.raw"
             sed -n 's/: test$//p' "${listed}.raw" | sort -u > "${listed}"
             if ! diff "${listed}" "${expected}" > "${listed}.diff"; then
