@@ -17,6 +17,8 @@ use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
+mod switchpro;
+
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
@@ -1292,6 +1294,10 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// Slots a pad answered in at the last look; a Switch Pro
+        /// Controller takes the first one none did.
+        taken: [bool; PADS],
+        switch_pro: super::switchpro::SwitchPro,
     }
 
     fn key_state(vk: u8) -> KeyState {
@@ -1305,34 +1311,49 @@ mod host {
         }
     }
 
+    impl Host {
+        /// The XInput pad in `slot`, `None` when it is empty.
+        fn xinput_pad(&mut self, slot: usize) -> Option<PadState> {
+            if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
+                return None;
+            }
+            let mut state = XINPUT_STATE::default();
+            // SAFETY: room for the state.
+            if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
+                self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
+                return None;
+            }
+            self.empty_until[slot] = None;
+            Some(convert(&state.Gamepad))
+        }
+    }
+
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
-            let empty = self.empty_until[slot].is_some_and(|until| Instant::now() < until);
-            if !empty {
-                let mut state = XINPUT_STATE::default();
-                // SAFETY: room for the state.
-                if unsafe { XInputGetState(slot as u32, &mut state) } == 0 {
-                    self.empty_until[slot] = None;
-                    return Some(convert(&state.Gamepad));
-                }
-                self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
-            }
+            let mut pad = self.xinput_pad(slot);
             // A DualSense is a HID device, not an XInput one; it plays slot 0
             // when no XInput pad answers there.
-            if slot == 0
-                && let Some(pad) = super::super::dualsense::latest()
+            if pad.is_none()
+                && slot == 0
+                && let Some(ds) = super::super::dualsense::latest()
             {
-                return Some(PadState {
-                    buttons: pad.buttons,
-                    left_trigger: pad.left_trigger,
-                    right_trigger: pad.right_trigger,
-                    left_x: pad.left_x,
-                    left_y: pad.left_y,
-                    right_x: pad.right_x,
-                    right_y: pad.right_y,
+                pad = Some(PadState {
+                    buttons: ds.buttons,
+                    left_trigger: ds.left_trigger,
+                    right_trigger: ds.right_trigger,
+                    left_x: ds.left_x,
+                    left_y: ds.left_y,
+                    right_x: ds.right_x,
+                    right_y: ds.right_y,
                 });
             }
-            None
+            // Neither can see a Switch Pro Controller; it takes the first
+            // slot they left empty.
+            if pad.is_none() && self.taken.iter().position(|&t| !t) == Some(slot) {
+                pad = self.switch_pro.state();
+            }
+            self.taken[slot] = pad.is_some();
+            pad
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
