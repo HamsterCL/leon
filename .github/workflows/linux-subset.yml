@@ -59,19 +59,21 @@ env:
   RUSTFMT_CRATES: >-
     -p victory-core -p victory-pe -p victory-pipeline -p victory-game
     -p victory-shader -p victory -p xtask
-  # Crates whose rustdoc builds with no warnings on Linux today (broken or
-  # private intra-doc links, bad code-block attributes, ...). victory-formats
-  # and victory-loader are not yet; add each one once it is.
+  # Crates whose rustdoc builds with no warnings on Linux (broken or private
+  # intra-doc links, bad code-block attributes, ...): LINUX_CRATES plus
+  # victory-gpu, whose docs build on Linux although its code does not.
   RUSTDOC_CRATES: >-
-    -p victory-core -p victory-pe -p victory-pipeline -p victory-game
-    -p victory-shader -p victory-gpu -p xtask
+    -p victory-core -p victory-pe -p victory-formats -p victory-pipeline
+    -p victory-game -p victory-loader -p victory-shader -p victory-gpu
+    -p xtask
   # Crates whose rustdoc builds with no warnings for the Windows target, where
   # cfg(windows) items (all of victory-hle, apps/victory's host) exist and the
-  # Linux rustdoc step never sees them. victory-formats and victory-loader
-  # are not clean yet; add each one once it is.
+  # Linux rustdoc step never sees them. Every workspace member but the
+  # host-only xtask, like WINDOWS_CLIPPY_CRATES.
   WINDOWS_RUSTDOC_CRATES: >-
-    -p victory-core -p victory-pe -p victory-pipeline -p victory-game
-    -p victory-hle -p victory-shader -p victory-gpu -p victory
+    -p victory-core -p victory-pe -p victory-formats -p victory-pipeline
+    -p victory-game -p victory-loader -p victory-shader -p victory-gpu
+    -p victory-hle -p victory
 
 jobs:
   # Each job's name repeats its id, so the check names that branch protection
