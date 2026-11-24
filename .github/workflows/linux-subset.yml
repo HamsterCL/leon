@@ -133,6 +133,9 @@ jobs:
       # --norc: a `.shellcheckrc` (committed, or added by a PR) cannot
       # quietly disable checks or drop these optional ones; disabling a check
       # takes an inline `# shellcheck disable=` next to the code, in review.
+      # -config-file /dev/null does the same for actionlint's own config: a
+      # `.github/actionlint.yaml` (or .yml) can `ignore:` any error by regex,
+      # which actionlint otherwise picks up silently.
       - name: actionlint
         env:
           SHELLCHECK_OPTS: >-
@@ -155,7 +158,7 @@ jobs:
           echo "${ACTIONLINT_SHA256}  ${tarball}" | sha256sum -c -
           tar xzf "${tarball}" actionlint
           cd "${GITHUB_WORKSPACE}"
-          "${RUNNER_TEMP}/actionlint" -color -shellcheck="${shellcheck_bin}" -pyflakes=
+          "${RUNNER_TEMP}/actionlint" -color -config-file /dev/null -shellcheck="${shellcheck_bin}" -pyflakes=
 
       # Security audit of the workflows, which actionlint does not do:
       # template injection in `run:` scripts, credentials persisted by
@@ -169,6 +172,9 @@ jobs:
       # the low-confidence ones pedantic still drops. Every one passes today.
       # --strict-collection fails on a workflow zizmor cannot parse, which it
       # otherwise only warns about and skips, auditing nothing in it.
+      # --no-config: a `zizmor.yml` or `.github/zizmor.yml` (committed, or
+      # added by a PR) cannot disable audits or loosen the pin policy unseen;
+      # silencing a finding takes an inline `# zizmor: ignore[...]`, in review.
       - name: zizmor
         env:
           ZIZMOR_VERSION: 1.32.0
@@ -181,7 +187,7 @@ jobs:
           echo "${ZIZMOR_SHA256}  ${tarball}" | sha256sum -c -
           tar xzf "${tarball}" zizmor
           cd "${GITHUB_WORKSPACE}"
-          "${RUNNER_TEMP}/zizmor" --color=always --persona=auditor --strict-collection .github/workflows
+          "${RUNNER_TEMP}/zizmor" --color=always --persona=auditor --strict-collection --no-config .github/workflows
 
       # Fast, needs no build: keep the clean packages clean. load_probe.rs is
       # checked by itself, since the rest of victory-loader is not clean yet.
