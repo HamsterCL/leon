@@ -33,17 +33,19 @@ jobs:
       - name: Verify Asset Policy (Rule #1)
         run: cargo xtask policy
 
-      - name: Verify Code Formatting
+      - name: Verify Code Formatting on Pull Request
+        if: github.event_name == 'pull_request'
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            CHANGED=$(git diff --name-only origin/main...HEAD -- '*.rs' || true)
-            if [ -n "$CHANGED" ]; then
-              echo "Checking formatting on changed files:"
-              echo "$CHANGED"
-              echo "$CHANGED" | xargs rustfmt --edition 2024 --check
-            else
-              echo "No Rust files modified in this PR."
-            fi
+          CHANGED=$(git diff --name-only --diff-filter=ACMR origin/main...HEAD -- '*.rs' || true)
+          if [ -n "$CHANGED" ]; then
+            echo "Checking formatting on changed files:"
+            echo "$CHANGED"
+            git diff -z --name-only --diff-filter=ACMR origin/main...HEAD -- '*.rs' | xargs -0 -r rustfmt --edition 2024 --check
           else
-            cargo fmt --all -- --check || true
+            echo "No Rust files modified in this PR."
           fi
+
+      - name: Check Workspace Formatting on Main (Informational)
+        if: github.event_name == 'push'
+        continue-on-error: true
+        run: cargo fmt --all -- --check
