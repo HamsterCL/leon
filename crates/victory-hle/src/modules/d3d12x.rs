@@ -51,6 +51,33 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
     let _ = dir;
 }
 
+/// Creates the host device, so shader translations made next match the
+/// ones a run makes. `false` without a host GPU.
+pub fn prepare_shader_host() -> bool {
+    #[cfg(windows)]
+    {
+        victory_gpu::shader_cache::prepare_host()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Puts one shader container in the shader cache; `true` when it had to be
+/// translated, `false` when the cache had it.
+pub fn prewarm_shader(container: &[u8]) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        victory_gpu::shader_cache::prewarm(container)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = container;
+        Err("no host GPU".into())
+    }
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "d3d12x",

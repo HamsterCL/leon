@@ -68,6 +68,35 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
+/// Creates the host device now, which also fixes the Wave64 lowering this
+/// host wants. A translation made before that would not be the one the
+/// title's first use makes, and would be cached under the wrong key.
+#[cfg(windows)]
+pub fn prepare_host() -> bool {
+    crate::host::host().is_some()
+}
+
+/// Translates one container into the cache as the title's first use would,
+/// and tells whether it took a translation (`true`) or the entry was there
+/// already (`false`). Without a cache folder it is an error.
+pub fn prewarm(container: &[u8]) -> Result<bool, String> {
+    let cache = CACHE.get().ok_or("no shader cache folder")?;
+    let wave64 = effective_wave64_mode();
+    let options = TranslateOptions { wave64 };
+    let mb = [mode_byte(wave64)];
+    let input = [&build()[..], &mb[..], container].concat();
+    let converter = Translate {
+        translate: |c: &[u8]| {
+            victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string())
+        },
+        ran: AtomicBool::new(false),
+    };
+    cache
+        .get_or_convert(&converter, &input)
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(converter.ran.load(Ordering::Relaxed))
+}
+
 /// What identifies this build: the BLAKE3 of our executable file and of
 /// the translation settings it runs with (the loop limit, which a
 /// diagnostics build can change at run time).
