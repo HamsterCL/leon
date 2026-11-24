@@ -121,7 +121,9 @@ jobs:
       # added later would silently get no clippy or rustdoc at all. Fail
       # instead: every member but the host-only xtask must be in both Windows
       # lists (which say they hold every member but xtask), and xtask, which
-      # nothing else lints, must be in LINUX_CRATES. Lists may still name
+      # nothing else lints, must be in LINUX_CRATES. Every LINUX_CRATES crate
+      # must also be in RUSTDOC_CRATES (which says it holds them all), so one
+      # moved onto Linux CI gets its rustdoc lints too. Lists may still name
       # fewer crates on purpose (LINUX_CRATES, RUSTFMT_CRATES, ...).
       - name: Crate lists cover the workspace
         run: |
@@ -132,14 +134,23 @@ jobs:
             echo "::error::cargo metadata listed no workspace members" >&2
             exit 1
           fi
-          declare -A linux=() clippy=() rustdoc=()
+          declare -A linux=() clippy=() rustdoc=() linux_rustdoc=()
           read -r -a args <<< "${LINUX_CRATES}"
           for a in "${args[@]}"; do linux["${a}"]=1; done
+          read -r -a args <<< "${RUSTDOC_CRATES}"
+          for a in "${args[@]}"; do linux_rustdoc["${a}"]=1; done
           read -r -a args <<< "${WINDOWS_CLIPPY_CRATES}"
           for a in "${args[@]}"; do clippy["${a}"]=1; done
           read -r -a args <<< "${WINDOWS_RUSTDOC_CRATES}"
           for a in "${args[@]}"; do rustdoc["${a}"]=1; done
           missing=0
+          read -r -a args <<< "${LINUX_CRATES}"
+          for c in "${args[@]}"; do
+            if [[ "${c}" != -p && ! -v linux_rustdoc["${c}"] ]]; then
+              echo "::error::LINUX_CRATES member ${c} is not in RUSTDOC_CRATES" >&2
+              missing=1
+            fi
+          done
           for m in "${members[@]}"; do
             if [[ "${m}" == xtask ]]; then
               if [[ ! -v linux["${m}"] ]]; then
