@@ -611,3 +611,67 @@ jobs:
             printf '%s\n' "${stray[@]}" >&2
             exit 1
           fi
+
+  # Cargo.toml declares `rust-version` (the MSRV) for every member, but the
+  # jobs above build with the newer toolchain pinned in rust-toolchain.toml,
+  # so code using a newer language feature or std API, or a Cargo.lock bump
+  # to a dependency that needs a newer rustc, passed CI and broke anyone
+  # building with the declared version. Type-check with exactly that version
+  # (read from Cargo.toml, so the two cannot drift): the Linux crates and the
+  # whole workspace for the Windows target, default and all features, plus
+  # the hle-probe fixture, which load_probe builds with the same cargo that
+  # ran the test. Only `cargo check`: older rustc and clippy warn
+  # differently, so warnings are left to the pinned-toolchain jobs. Its own
+  # target dir in RUNNER_TEMP keeps a second compiler's output out of the
+  # rust-cache entries the other jobs share.
+  msrv:
+    name: msrv
+    runs-on: ubuntu-24.04
+    # checkout only.
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    env:
+      # As in windows-target-check: blake3's build script picks its
+      # pure-Rust code instead of calling MSVC's tools. Nothing is linked.
+      CARGO_FEATURE_PURE: "1"
+    steps:
+      # Nothing here pushes; keep the token out of .git/config.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # The root [workspace.package] rust-version is read with the runner's
+      # Python 3 tomllib (-I: no site packages, no cwd on sys.path), since
+      # cargo would first install the pinned toolchain. Every member must
+      # inherit it; one that declares its own would not be checked against
+      # the version it claims. --no-self-update: as in the linux job.
+      - name: Install the rust-version toolchain
+        run: |
+          msrv="$(python3 -I -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["rust-version"])')"
+          if [[ ! "${msrv}" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "::error file=Cargo.toml::unexpected workspace rust-version '${msrv}'" >&2
+            exit 1
+          fi
+          rustup toolchain install "${msrv}" --profile minimal --target x86_64-pc-windows-msvc --no-self-update
+          metadata="$(cargo +"${msrv}" metadata --locked --no-deps --format-version 1)"
+          others="$(jq -r --arg v "${msrv}" '.packages[] | select(.rust_version != $v) | "\(.name) (\(.rust_version))"' <<< "${metadata}")"
+          if [[ -n "${others}" ]]; then
+            echo "::error::workspace members whose rust-version is not the workspace's ${msrv}:" >&2
+            printf '%s\n' "${others}" >&2
+            exit 1
+          fi
+          echo "MSRV=${msrv}" >> "${GITHUB_ENV}"
+          echo "CARGO_TARGET_DIR=${RUNNER_TEMP}/msrv-target" >> "${GITHUB_ENV}"
+
+      - name: cargo check (Linux crates)
+        run: |
+          read -r -a crates <<< "${LINUX_CRATES}"
+          cargo +"${MSRV}" check --locked --all-targets "${crates[@]}"
+          cargo +"${MSRV}" check --locked --all-targets --all-features "${crates[@]}"
+
+      - name: cargo check (Windows target, workspace and hle-probe fixture)
+        run: |
+          cargo +"${MSRV}" check --locked --workspace --all-targets --target x86_64-pc-windows-msvc
+          cargo +"${MSRV}" check --locked --workspace --all-targets --all-features --target x86_64-pc-windows-msvc
+          cargo +"${MSRV}" check --locked --all-targets --target x86_64-pc-windows-msvc --manifest-path tests/fixtures/hle-probe/Cargo.toml
