@@ -42,6 +42,15 @@ fn line(counts: &Counts, total: usize, since: Instant) -> String {
 pub fn run(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    translate(&cfg, paths, jobs)
+}
+
+/// The same with the cache folder already in use, as `run --prewarm` has it.
+pub fn translate(
+    cfg: &victory_core::Config,
+    paths: Vec<PathBuf>,
+    jobs: Option<usize>,
+) -> Result<()> {
     let files = if paths.is_empty() {
         vec![cfg.require_game_dir()?.join("shaders.rpf")]
     } else {
