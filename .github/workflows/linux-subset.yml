@@ -710,8 +710,22 @@ jobs:
       # below never sees the temp dir, and on a contributor's machine the
       # leftovers pile up in /tmp with every run. rustc and the linker clean
       # up their own temp files there, so the directory must end up empty.
+      # HOME is a fresh, empty directory too, with the XDG base directories
+      # unset: victory-core's config falls back to $XDG_CACHE_HOME or
+      # ~/.cache for its cache and data, so a test that resolves the default
+      # config instead of passing its own paths would read a contributor's
+      # real cache (game data included) and write into it, passing there and
+      # nowhere else. Anything a test leaves in that HOME fails the step as
+      # well. rustup and cargo keep their own homes: both are pinned to where
+      # they were before HOME moves, so the toolchain and the registry cache
+      # are the ones the steps above used.
       - name: cargo test
         run: |
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
+          export HOME="${RUNNER_TEMP}/cargo-test-home"
+          mkdir "${HOME}"
+          unset XDG_CACHE_HOME XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME
           export TMPDIR="${RUNNER_TEMP}/cargo-test-tmp"
           mkdir "${TMPDIR}"
           read -r -a crates <<< "${LINUX_CRATES}"
@@ -729,6 +743,12 @@ jobs:
           leftovers="$(find "${TMPDIR}" -mindepth 1 -maxdepth 2)"
           if [[ -n "${leftovers}" ]]; then
             echo "::error::cargo test left files in TMPDIR" >&2
+            printf '%s\n' "${leftovers}" >&2
+            exit 1
+          fi
+          leftovers="$(find "${HOME}" -mindepth 1 -maxdepth 3)"
+          if [[ -n "${leftovers}" ]]; then
+            echo "::error::cargo test wrote into HOME" >&2
             printf '%s\n' "${leftovers}" >&2
             exit 1
           fi
