@@ -705,7 +705,18 @@ jobs:
       # steps: `diagnostics` changes what some code does (victory-core's log
       # cap, victory-shader's loop limit read from the environment), so the
       # tests must pass with it too, not only compile.
-      # Both runs get a fresh, empty TMPDIR (std::env::temp_dir() reads it), so
+      # Two more runs build the tests the way the game itself is built: the
+      # release profile (what ships), and the diag profile with every feature
+      # (the development build, `--profile diag --features diagnostics`). Both
+      # optimise and drop debug assertions and overflow checks, which the dev
+      # profile above keeps: an invariant held only by a debug_assert (the
+      # shader IR and bitcode writer have several), arithmetic that panics in
+      # debug but wraps in release, or unsafe code (the loader's, the PE
+      # parser's) whose undefined behaviour only shows once the optimiser
+      # relies on it would otherwise pass here and misbehave only in a real
+      # build. Each adds one optimised build of the crates, well under the
+      # job's timeout.
+      # All four runs get a fresh, empty TMPDIR (std::env::temp_dir() reads it), so
       # a test that leaves scratch files behind fails here: the checkout check
       # below never sees the temp dir, and on a contributor's machine the
       # leftovers pile up in /tmp with every run. rustc and the linker clean
@@ -719,7 +730,7 @@ jobs:
       # well. rustup and cargo keep their own homes: both are pinned to where
       # they were before HOME moves, so the toolchain and the registry cache
       # are the ones the steps above used.
-      # Both runs also have no network: they run in a new network namespace
+      # All four also have no network: they run in a new network namespace
       # (unshare, as the runner user, so permission checks still apply) that
       # holds only a downed loopback, with CARGO_NET_OFFLINE set. A test or
       # build script that downloads something (a fixture, a reference file)
@@ -760,6 +771,8 @@ jobs:
           )
           "${offline[@]}" cargo test --locked --no-fail-fast "${crates[@]}" -- --exact "${skips[@]}"
           "${offline[@]}" cargo test --locked --no-fail-fast --all-features "${crates[@]}" -- --exact "${skips[@]}"
+          "${offline[@]}" cargo test --locked --no-fail-fast --release "${crates[@]}" -- --exact "${skips[@]}"
+          "${offline[@]}" cargo test --locked --no-fail-fast --profile diag --all-features "${crates[@]}" -- --exact "${skips[@]}"
           leftovers="$(find "${TMPDIR}" -mindepth 1 -maxdepth 2)"
           if [[ -n "${leftovers}" ]]; then
             echo "::error::cargo test left files in TMPDIR" >&2
