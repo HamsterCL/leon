@@ -13,6 +13,14 @@ on:
 permissions:
   contents: read
 
+# An explicit `shell: bash` runs scripts as `bash --noprofile --norc -eo
+# pipefail`; the implicit default is plain `bash -e`, where a failing command
+# on the left of a pipe (e.g. the `echo ... | sha256sum -c -` checksum checks)
+# is ignored. Set it once so every `run:` script gets pipefail.
+defaults:
+  run:
+    shell: bash
+
 # Actions are pinned to full commit SHAs (tag in the trailing comment): a tag
 # can be moved to other code, a commit cannot. Bump both together.
 
@@ -89,8 +97,14 @@ jobs:
       # PATH, so a runner image without it would pass every `run:` script
       # unchecked. Fail instead, and pass the binary explicitly so the check
       # cannot be dropped by a PATH change. pyflakes is off: no step runs Python.
+      # SHELLCHECK_OPTS turns on ShellCheck's optional checks (masked return
+      # codes, `set -e` suppressed in functions, unassigned uppercase vars,
+      # `[[ ]]` over `[ ]`, ...) for the `run:` scripts. All of them pass
+      # today but require-variable-braces (SC2250), which is style only.
       - name: actionlint
         env:
+          SHELLCHECK_OPTS: >-
+            --enable=add-default-case,avoid-nullary-conditions,check-extra-masked-returns,check-set-e-suppressed,check-unassigned-uppercase,deprecate-which,quote-safe-variables,require-double-brackets
           ACTIONLINT_VERSION: 1.7.7
           ACTIONLINT_SHA256: 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
         run: |
