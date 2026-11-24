@@ -1177,8 +1177,7 @@ mod host {
                 return xinput;
             }
             // The first slot XInput left empty is the Switch Pro Controller's.
-            let first_free = self.xinput.iter().position(|&taken| !taken);
-            if first_free == Some(slot) {
+            if self.xinput[..slot].iter().all(|&taken| taken) {
                 return self.switch_pro.state();
             }
             None
