@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod prewarm;
 mod run;
 mod shader;
 mod translate;
@@ -81,6 +82,14 @@ enum Command {
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
+        /// Worker threads (default: every logical core).
+        #[arg(long)]
+        jobs: Option<usize>,
+    },
+    /// Translate the game's shaders into the cache before a run, with a
+    /// progress line (default: `shaders.rpf` of the configured game).
+    Prewarm {
+        paths: Vec<PathBuf>,
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
@@ -163,6 +172,7 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
+        Command::Prewarm { paths, jobs } => prewarm::run(paths, jobs),
         Command::Run {
             exe,
             unimplemented,
