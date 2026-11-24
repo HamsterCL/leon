@@ -337,6 +337,13 @@ pub(crate) struct HostList {
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
 }
 
+// SAFETY: D3D12 command lists, allocators, resources, and retained IUnknown
+// handles are free-threaded COM objects; interior state is behind Mutex or
+// OnceLock, and execution/prelude recording is serialized under Host::submitted.
+unsafe impl Send for HostList {}
+// SAFETY: as above.
+unsafe impl Sync for HostList {}
+
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
 const STAMPS: u32 = 4096;
@@ -435,8 +442,19 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// Dynamic descriptor slots owned by this host list segment: title heap,
+    /// first slot, count; released when the segment resets or drops.
+    dynamic: Vec<(usize, u32, u32)>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+}
+
+impl Drop for Deferred {
+    fn drop(&mut self) {
+        for &(heap, first, n) in &self.dynamic {
+            crate::descriptor::release_dynamic(heap, first, n);
+        }
+    }
 }
 
 impl Host {
@@ -630,6 +648,8 @@ impl Host {
             }
         }
         self.log_messages();
+        drop(submitted);
+        crate::queue::notify_memory_waiters();
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -773,12 +793,18 @@ impl Host {
         first_error
     }
 
-    /// A host render target view of `resource`, valid until it is recorded.
+    /// A host render target view of `resource`, valid until it is recorded,
+    /// or `None` if the host resource lacks `ALLOW_RENDER_TARGET`.
     pub(crate) fn rtv(
         &self,
         resource: &ID3D12Resource,
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
-    ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+    ) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+        // SAFETY: a live resource.
+        let flags = unsafe { resource.GetDesc() }.Flags;
+        if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 == 0 {
+            return None;
+        }
         let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
         // SAFETY: a slot of our heap and a live resource.
         unsafe {
@@ -786,7 +812,7 @@ impl Host {
             handle.ptr += (slot * self.rtv_size) as usize;
             self.device
                 .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
-            handle
+            Some(handle)
         }
     }
 
@@ -1161,6 +1187,12 @@ impl HostList {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
         }
+    }
+
+    /// Keeps dynamic descriptor slots `[first, first + count)` of `heap`
+    /// alive until this host list segment is reset or dropped.
+    pub(crate) fn keep_dynamic(&self, heap: usize, first: u32, count: u32) {
+        self.deferred().dynamic.push((heap, first, count));
     }
 
     /// Whether this is the first time since the reset that the list asks
@@ -1663,7 +1695,14 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ),
             ]);
-            list.CopyResource(&back, texture);
+            // Diagnostics: `VICTORY_SHOW_TARGET` shows one of the title's render targets instead.
+            #[cfg(feature = "diagnostics")]
+            let shown = crate::capture::show(list, &back);
+            #[cfg(not(feature = "diagnostics"))]
+            let shown = false;
+            if !shown {
+                list.CopyResource(&back, texture);
+            }
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))

@@ -160,6 +160,9 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// Root UAVs (raw buffers) the shader reads and writes: `u<index>` in
+    /// [`ROOT_CBV_SPACE`].
+    pub root_uavs: Vec<u8>,
 }
 
 impl HostShader {
@@ -235,7 +238,8 @@ pub fn translate_with(
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
-    let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    let spilled = native.spills_root_args();
+    let p = ir::build_with(&native.patched_code(), native.wave64, native.vgprs, spilled)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
@@ -359,6 +363,7 @@ pub fn emit_with(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
     })
 }
 
@@ -742,6 +747,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -752,6 +758,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -973,23 +980,6 @@ mod tests {
         assert_eq!(copy[4..20], ours[..], "container hash disagrees");
     }
 
-    /// [`validate_if_available`] for a test written against validator 1.8
-    /// (the one `dx.valver` 1.8 modules and the harmonized packed rows are
-    /// checked by); an older `dxil.dll` skips it, as the stock Windows SDK's
-    /// (1.7) rejects them for reasons of its own version.
-    #[cfg(windows)]
-    fn validate_if_1_8_available(dxil: &[u8]) {
-        let path = super::validator::Validator::default_path();
-        if let Ok(v) = super::validator::Validator::load(path.as_deref())
-            && let Some(version) = v.version()
-            && version < (1, 8)
-        {
-            eprintln!("dxil.dll validates {version:?}, older than (1, 8); skipped");
-            return;
-        }
-        validate_if_available(dxil);
-    }
-
     fn emit_synthetic(
         parts: &[(FourCC, &[u8])],
         native: &NativeProgram,
@@ -1135,7 +1125,7 @@ mod tests {
         let host =
             emit_synthetic(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)], &native).unwrap();
         #[cfg(windows)]
-        validate_if_1_8_available(&host.dxil);
+        validate_if_available(&host.dxil);
     }
 
     #[test]
@@ -1275,7 +1265,19 @@ mod tests {
         assert_eq!(crate::dxbc::u32_at(psv0, 0).unwrap(), 52);
         #[cfg(windows)]
         {
-            validate_if_1_8_available(&cs.dxil);
+            // A validator older than 1.8 (DXC 1.7 and before) refuses the
+            // module's `dx.valver` 1.8 outright. Translated shaders never go
+            // through dxil.dll (they carry our container hash), so only this
+            // check depends on it.
+            let path = super::validator::Validator::default_path();
+            let version = super::validator::Validator::load(path.as_deref())
+                .ok()
+                .and_then(|v| v.version());
+            if version.is_some_and(|v| v < (1, 8)) {
+                eprintln!("dxil.dll validator {version:?} predates 1.8; validation skipped");
+            } else {
+                validate_if_available(&cs.dxil);
+            }
             if let Ok(host) = super::host::Host::new(false) {
                 host.compute_pipeline(&cs).unwrap();
             }

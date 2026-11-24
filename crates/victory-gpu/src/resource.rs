@@ -237,6 +237,97 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
+/// The 32-bit format that stands in for [`NARROW`] formats the host cannot
+/// render to or store to as unordered access (B8G8R8A8_UNORM: the same
+/// channels, wider).
+pub(crate) const WIDE: u32 = 87;
+
+/// 16-bit packed color formats (B5G6R5, B5G5R5A1, B4G4R4A4) whose render
+/// target and typed unordered-access support is optional: NVIDIA refuses
+/// B4G4R4A4 targets and B5G5R5A1 typed stores, which the console (and AMD)
+/// allow.
+const NARROW: [u32; 3] = [85, 86, 115];
+
+/// Whether render-target and unordered-access textures of `format` get a
+/// [`WIDE`] host copy, which their views, target views and pipelines then
+/// name: the host lacks render-target or typed unordered-access store
+/// support for it. Decided per format once (pipelines name the format
+/// without the texture).
+/// shortcut: blending and stores keep 8 bits per channel where the console
+/// rounds to 4 or 5; copies between a widened texture and a native one of
+/// the same title format are skipped.
+#[cfg(windows)]
+pub(crate) fn widened(format: u32) -> bool {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    static DECIDED: std::sync::OnceLock<[bool; NARROW.len()]> = std::sync::OnceLock::new();
+    let Some(i) = NARROW.iter().position(|&f| f == format) else {
+        return false;
+    };
+    if let Some(decided) = DECIDED.get() {
+        return decided[i];
+    }
+    let Some(host) = crate::host::host() else {
+        return false;
+    };
+    DECIDED.get_or_init(|| {
+        NARROW.map(|f| {
+            let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: DXGI_FORMAT(f as i32),
+                ..Default::default()
+            };
+            // SAFETY: a plain query into a structure of its size.
+            let asked = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut support).cast(),
+                    size_of_val(&support) as u32,
+                )
+            };
+            let target = support.Support1.0 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 != 0;
+            let store = support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0
+                != 0
+                && support.Support2.0 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 != 0;
+            let wide = asked.is_err() || !target || !store;
+            if wide {
+                tracing::info!(
+                    format = f,
+                    target,
+                    store,
+                    "render targets and unordered access of this format get 32-bit host copies"
+                );
+            }
+            wide
+        })
+    })[i]
+}
+
+#[cfg(not(windows))]
+pub(crate) fn widened(_: u32) -> bool {
+    false
+}
+
+/// The format a host target view or pipeline names for title format
+/// `format` (as the host has it): [`WIDE`] where [`widened`].
+pub(crate) fn target_format(format: u32) -> u32 {
+    if widened(format) { WIDE } else { format }
+}
+
+/// Whether `this`'s host copy is a [`WIDE`] stand-in for its title format.
+#[cfg(windows)]
+pub(crate) fn is_widened(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let r = resource(this);
+    let Some(host) = r.host.as_ref() else {
+        return false;
+    };
+    // SAFETY: a live resource.
+    let host_format = unsafe { host.texture.GetDesc() }.Format.0 as u32;
+    host_format == WIDE && NARROW.contains(&r.desc.format)
+}
+
 /// The typeless format of a format's family (itself if it has none).
 pub(crate) fn family(format: u32) -> u32 {
     const FAMILIES: [(u32, u32); 22] = [
@@ -279,6 +370,7 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
+#[cfg(windows)]
 pub(crate) fn view_format(this: This) -> Option<u32> {
     let own = pc_format(resource(this).desc.format);
     let host = host_resource(this)?;
@@ -823,6 +915,10 @@ fn host_texture(
         d.flags &= !UNORDERED;
     }
     d.format = pc_format(d.format);
+    const RENDER_TARGET: u32 = 1;
+    if d.flags & (RENDER_TARGET | UNORDERED) != 0 && widened(d.format) {
+        d.format = WIDE;
+    }
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -834,12 +930,47 @@ fn host_texture(
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    // Some console formats (such as B5G5R5A1_UNORM) allow unordered access
+    // or render-target flags on the console that PC GPUs refuse; drop
+    // unsupported flags on typed formats so the host copy is still created.
+    let typeless = family(d.format) == d.format && family(d.format + 1) == d.format;
+    if !typeless && d.flags & (RENDER_TARGET | UNORDERED) != 0 {
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(d.format as i32),
+            ..Default::default()
+        };
+        // SAFETY: plain feature query into our struct.
+        let ok = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>() as u32,
+            )
+        }
+        .is_ok();
+        if ok {
+            if d.flags & UNORDERED != 0
+                && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 == 0
+            {
+                d.flags &= !UNORDERED;
+            }
+            if d.flags & RENDER_TARGET != 0
+                && support.Support1.0 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 == 0
+            {
+                d.flags &= !RENDER_TARGET;
+            }
+        }
+    }
     // The clear value names the format too: format, then color or depth
-    // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
+    // and stencil (5 words). D3D12 requires a null optimized clear value
+    // when neither render-target nor depth-stencil is set (id=815).
+    let clear_value = (!clear.is_null() && d.flags & (RENDER_TARGET | DEPTH) != 0).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
+        if d.format == WIDE {
+            value[0] = target_format(value[0]);
+        }
         value
     });
     let heap = D3D12_HEAP_PROPERTIES {
@@ -1840,5 +1971,82 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn host_texture_drops_unsupported_uav_flag_for_b5g5r5a1() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        // What an adapter refuses depends on the adapter (some accept a typed
+        // UAV on B5G5R5A1_UNORM), and `host_texture` drops exactly that, so
+        // the expectations ask the adapter the same way.
+        let supports = |format: u32, flag: D3D12_FORMAT_SUPPORT1| {
+            let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(format as i32),
+                ..Default::default()
+            };
+            // SAFETY: plain feature query into our struct.
+            unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut support).cast(),
+                    size_of::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>() as u32,
+                )
+            }
+            .is_ok_and(|()| support.Support1.0 & flag.0 != 0)
+        };
+        let make = |format: u32, flags: u32| ResourceDesc {
+            dimension: 3, // TEXTURE2D
+            alignment: 0,
+            width: 64,
+            height: 64,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags,
+        };
+        // B5G5R5A1_UNORM (86) with ALLOW_RENDER_TARGET | ALLOW_UNORDERED_ACCESS (5):
+        // an adapter that refuses a typed UAV on this format gets the texture
+        // without the UAV flag, so the host copy succeeds; one that accepts it
+        // keeps the flag.
+        let b5g5r5a1 = host_texture(&make(86, 5), 0, std::ptr::null())
+            .expect("B5G5R5A1_UNORM texture should be created");
+        // SAFETY: live D3D12 resource.
+        let d = unsafe { b5g5r5a1.GetDesc() };
+        assert_eq!(
+            d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0,
+            supports(86, D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)
+        );
+        assert_eq!(
+            d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 != 0,
+            supports(86, D3D12_FORMAT_SUPPORT1_RENDER_TARGET)
+        );
+
+        // B4G4R4A4_UNORM (115) with ALLOW_RENDER_TARGET (1) and a non-null
+        // clear value: where the adapter refuses a render target on it,
+        // dropping RENDER_TARGET must also omit pOptimizedClearValue so
+        // CreateCommittedResource succeeds without id=815.
+        let clear = [115u32, 0, 0, 0, 0];
+        let b4g4r4a4 = host_texture(&make(115, 1), 0, clear.as_ptr().cast())
+            .expect("B4G4R4A4_UNORM texture should succeed with clear value dropped");
+        // SAFETY: live D3D12 resource.
+        let bd = unsafe { b4g4r4a4.GetDesc() };
+        assert_eq!(
+            bd.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 != 0,
+            supports(115, D3D12_FORMAT_SUPPORT1_RENDER_TARGET)
+        );
+
+        // R8G8B8A8_TYPELESS (27) with flags=5 must keep ALLOW_UNORDERED_ACCESS.
+        let typeless = host_texture(&make(27, 5), 0, std::ptr::null())
+            .expect("R8G8B8A8_TYPELESS texture should succeed");
+        // SAFETY: live D3D12 resource.
+        let td = unsafe { typeless.GetDesc() };
+        assert_ne!(td.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0, 0);
     }
 }
