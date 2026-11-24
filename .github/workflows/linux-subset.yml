@@ -107,8 +107,13 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # Spelled out rather than the `cargo xtask` alias (`run --package xtask
+      # --`), which has no room for --locked: this is the job's first cargo
+      # command, and without it a Cargo.lock out of date with the manifests
+      # would be rewritten here, so every later `--locked` step would check
+      # against the rewritten file and pass.
       - name: Asset policy
-        run: cargo xtask policy
+        run: cargo run --locked --quiet --package xtask -- policy
 
       # Lints all workflows: expression and context typos, unknown keys, and
       # (via ShellCheck) the `run:` scripts, which YAML parsing alone never
