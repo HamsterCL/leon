@@ -138,10 +138,13 @@ jobs:
       # which actionlint otherwise picks up silently.
       # actionlint only sees `run:` scripts, so the same ShellCheck (same
       # SHELLCHECK_OPTS, which ShellCheck reads itself) then lints the
-      # standalone scripts too: the git hooks and any tracked *.sh / *.bash.
-      # The list comes from `git ls-files`, so a script added later is
-      # checked without editing this step; the step fails if the list is
-      # empty, rather than passing while checking nothing.
+      # standalone scripts too: the git hooks, any tracked *.sh / *.bash, and
+      # any tracked text file whose first line is a sh/bash/dash/ksh shebang
+      # (a script with no extension, e.g. under scripts/). The list comes
+      # from git, so a script added later is checked without editing this
+      # step; the step fails if the list is empty, rather than passing while
+      # checking nothing. File names are NUL-delimited end to end, so no name
+      # (spaces, newlines, a leading `-`) can split, glob or become a flag.
       - name: actionlint + ShellCheck
         env:
           SHELLCHECK_OPTS: >-
@@ -165,13 +168,25 @@ jobs:
           tar xzf "${tarball}" actionlint
           cd "${GITHUB_WORKSPACE}"
           "${RUNNER_TEMP}/actionlint" -color -config-file /dev/null -shellcheck="${shellcheck_bin}" -pyflakes=
-          scripts="$(git ls-files -- '.githooks/*' '*.sh' '*.bash')"
-          if [[ -z "${scripts}" ]]; then
+          list="${RUNNER_TEMP}/shell-scripts"
+          git ls-files -z -- '.githooks/*' '*.sh' '*.bash' > "${list}"
+          # git grep exits 1 when nothing matches; any other failure stops.
+          git grep -lzI -e '^#!' > "${list}.candidates" || [[ $? -eq 1 ]]
+          shebang_re='^#![[:space:]]*(/usr)?/bin/(env[[:space:]]+)?(ba|da|k)?sh([[:space:]]|$)'
+          while IFS= read -r -d '' f; do
+            first_line="$(head -n 1 -- "${f}")"
+            if [[ "${first_line}" =~ ${shebang_re} ]]; then
+              printf '%s\0' "${f}" >> "${list}"
+            fi
+          done < "${list}.candidates"
+          sort -zu -o "${list}" -- "${list}"
+          mapfile -d '' -t script_list < "${list}"
+          if [[ "${#script_list[@]}" -eq 0 ]]; then
             echo "::error::no shell scripts found to check" >&2
             exit 1
           fi
-          mapfile -t script_list <<< "${scripts}"
-          "${shellcheck_bin}" "${script_list[@]}"
+          printf 'ShellCheck: %s\n' "${script_list[@]}"
+          "${shellcheck_bin}" -- "${script_list[@]}"
 
       # Security audit of the workflows, which actionlint does not do:
       # template injection in `run:` scripts, credentials persisted by
