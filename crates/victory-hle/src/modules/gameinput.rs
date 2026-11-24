@@ -17,6 +17,8 @@ use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
+mod switchpro;
+
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
@@ -1130,10 +1132,15 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// Slots XInput filled at the last look; a Switch Pro Controller,
+        /// which XInput cannot see, takes the first one it did not.
+        xinput: [bool; PADS],
+        switch_pro: super::switchpro::SwitchPro,
     }
 
-    impl Source for Host {
-        fn pad(&mut self, slot: usize) -> Option<PadState> {
+    impl Host {
+        /// The XInput pad in `slot`, `None` when it is empty.
+        fn xinput_pad(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
@@ -1159,6 +1166,22 @@ mod host {
                 }
             }
             Some(pad)
+        }
+    }
+
+    impl Source for Host {
+        fn pad(&mut self, slot: usize) -> Option<PadState> {
+            let xinput = self.xinput_pad(slot);
+            self.xinput[slot] = xinput.is_some();
+            if xinput.is_some() {
+                return xinput;
+            }
+            // The first slot XInput left empty is the Switch Pro Controller's.
+            let first_free = self.xinput.iter().position(|&taken| !taken);
+            if first_free == Some(slot) {
+                return self.switch_pro.state();
+            }
+            None
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
