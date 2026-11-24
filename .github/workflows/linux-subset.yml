@@ -136,7 +136,13 @@ jobs:
       # -config-file /dev/null does the same for actionlint's own config: a
       # `.github/actionlint.yaml` (or .yml) can `ignore:` any error by regex,
       # which actionlint otherwise picks up silently.
-      - name: actionlint
+      # actionlint only sees `run:` scripts, so the same ShellCheck (same
+      # SHELLCHECK_OPTS, which ShellCheck reads itself) then lints the
+      # standalone scripts too: the git hooks and any tracked *.sh / *.bash.
+      # The list comes from `git ls-files`, so a script added later is
+      # checked without editing this step; the step fails if the list is
+      # empty, rather than passing while checking nothing.
+      - name: actionlint + ShellCheck
         env:
           SHELLCHECK_OPTS: >-
             --norc
@@ -159,6 +165,13 @@ jobs:
           tar xzf "${tarball}" actionlint
           cd "${GITHUB_WORKSPACE}"
           "${RUNNER_TEMP}/actionlint" -color -config-file /dev/null -shellcheck="${shellcheck_bin}" -pyflakes=
+          scripts="$(git ls-files -- '.githooks/*' '*.sh' '*.bash')"
+          if [[ -z "${scripts}" ]]; then
+            echo "::error::no shell scripts found to check" >&2
+            exit 1
+          fi
+          mapfile -t script_list <<< "${scripts}"
+          "${shellcheck_bin}" "${script_list[@]}"
 
       # Security audit of the workflows, which actionlint does not do:
       # template injection in `run:` scripts, credentials persisted by
