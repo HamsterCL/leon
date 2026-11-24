@@ -173,6 +173,47 @@ jobs:
           fi
           printf 'Covered: %s\n' "${members[@]}"
 
+      # The clippy and rustdoc steps lint with whatever `[lints]` each crate
+      # declares, so a member added (or edited) without `[lints] workspace =
+      # true` silently drops `undocumented_unsafe_blocks`,
+      # `unsafe_op_in_unsafe_fn = deny`, ... and still passes. The hle-probe
+      # fixture is outside the workspace and repeats those lints by hand
+      # ("keep the two in step"); fail when the copies drift apart. cargo
+      # metadata does not report lints, so the manifests are read with the
+      # runner's Python 3 tomllib (-I: no site packages, no cwd on sys.path).
+      - name: Workspace lints apply everywhere
+        run: |
+          metadata="$(cargo metadata --locked --no-deps --format-version 1)"
+          manifests="$(jq -r '.packages[].manifest_path' <<< "${metadata}")"
+          mapfile -t manifest_list <<< "${manifests}"
+          python3 -I - Cargo.toml tests/fixtures/hle-probe/Cargo.toml "${manifest_list[@]}" <<'EOF'
+          import sys, tomllib
+
+          def load(path):
+              with open(path, "rb") as f:
+                  return tomllib.load(f)
+
+          root, fixture, *members = sys.argv[1:]
+          want = load(root).get("workspace", {}).get("lints")
+          failed = False
+          if not want:
+              print("::error::root Cargo.toml has no [workspace.lints]", file=sys.stderr)
+              failed = True
+          if len(members) < 2:
+              print("::error::cargo metadata listed no workspace members", file=sys.stderr)
+              failed = True
+          for m in members:
+              if load(m).get("lints") != {"workspace": True}:
+                  print(f"::error file={m}::[lints] must be exactly `workspace = true`", file=sys.stderr)
+                  failed = True
+          if load(fixture).get("lints") != want:
+              print(f"::error file={fixture}::[lints] differs from the root [workspace.lints]", file=sys.stderr)
+              failed = True
+          if failed:
+              sys.exit(1)
+          print(f"Workspace lints on {len(members)} members and the hle-probe fixture")
+          EOF
+
       # Lints all workflows: expression and context typos, unknown keys, and
       # (via ShellCheck) the `run:` scripts, which YAML parsing alone never
       # checks. actionlint silently skips the shell checks when shellcheck is
