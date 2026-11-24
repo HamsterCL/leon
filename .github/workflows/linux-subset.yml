@@ -719,8 +719,28 @@ jobs:
       # well. rustup and cargo keep their own homes: both are pinned to where
       # they were before HOME moves, so the toolchain and the registry cache
       # are the ones the steps above used.
+      # Both runs also have no network: they run in a new network namespace
+      # (unshare, as the runner user, so permission checks still apply) that
+      # holds only a downed loopback, with CARGO_NET_OFFLINE set. A test or
+      # build script that downloads something (a fixture, a reference file)
+      # passes here only by luck of the network and fails for anyone offline
+      # or behind a proxy; this makes it fail every time instead. The steps
+      # above already fetched every dependency, all features included, into
+      # CARGO_HOME. Ubuntu 24.04 lets unprivileged users create user
+      # namespaces only after an AppArmor sysctl is lifted, so lift it first
+      # (on this throwaway runner) and fail loudly if unshare still cannot.
       - name: cargo test
         run: |
+          userns=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [[ -e "${userns}" && "$(< "${userns}")" != 0 ]]; then
+            sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          offline=(unshare --user --map-current-user --net --)
+          if [[ "$("${offline[@]}" id -u)" != "$(id -u)" ]]; then
+            echo "::error::unshare did not keep the runner's user id" >&2
+            exit 1
+          fi
+          export CARGO_NET_OFFLINE=true
           export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
           export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
           export HOME="${RUNNER_TEMP}/cargo-test-home"
@@ -738,8 +758,8 @@ jobs:
             --skip prepare::tests::keeps_iat_slots_when_import_size_excludes_the_terminator
             --skip prepare::tests::file_name_is_stable_per_build
           )
-          cargo test --locked --no-fail-fast "${crates[@]}" -- --exact "${skips[@]}"
-          cargo test --locked --no-fail-fast --all-features "${crates[@]}" -- --exact "${skips[@]}"
+          "${offline[@]}" cargo test --locked --no-fail-fast "${crates[@]}" -- --exact "${skips[@]}"
+          "${offline[@]}" cargo test --locked --no-fail-fast --all-features "${crates[@]}" -- --exact "${skips[@]}"
           leftovers="$(find "${TMPDIR}" -mindepth 1 -maxdepth 2)"
           if [[ -n "${leftovers}" ]]; then
             echo "::error::cargo test left files in TMPDIR" >&2
