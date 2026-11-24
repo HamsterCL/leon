@@ -740,16 +740,22 @@ jobs:
       # CARGO_HOME. Ubuntu 24.04 lets unprivileged users create user
       # namespaces only after an AppArmor sysctl is lifted, so lift it first
       # (on this throwaway runner) and fail loudly if unshare still cannot.
+      # All four also start from an empty environment (env -i) that keeps
+      # only what Cargo, rustup and the linker need, plus the settings above.
+      # The runner exports dozens of variables a contributor's shell never
+      # has (CI, GITHUB_*, RUNNER_*, ImageOS, a UTF-8 LANG), and a
+      # contributor's shell has ones the runner never does (VICTORY_LOG,
+      # RUST_LOG, VICTORY_CONFIG, LOCALAPPDATA, LC_ALL): a test that reads
+      # any of them, directly or through a default it resolves, passes in
+      # one place and fails in the other. With none of them set, a test sees
+      # the same environment here as under `env -i` locally. A kept variable
+      # that is unset becomes empty rather than going missing, which would
+      # change what Cargo and rustup do, so only set ones are passed on.
       - name: cargo test
         run: |
           userns=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
           if [[ -e "${userns}" && "$(< "${userns}")" != 0 ]]; then
             sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
-          fi
-          offline=(unshare --user --map-current-user --net --)
-          if [[ "$("${offline[@]}" id -u)" != "$(id -u)" ]]; then
-            echo "::error::unshare did not keep the runner's user id" >&2
-            exit 1
           fi
           export CARGO_NET_OFFLINE=true
           export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
@@ -759,6 +765,25 @@ jobs:
           unset XDG_CACHE_HOME XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME
           export TMPDIR="${RUNNER_TEMP}/cargo-test-tmp"
           mkdir "${TMPDIR}"
+          keep=()
+          for name in PATH HOME TMPDIR CARGO_HOME RUSTUP_HOME CARGO_NET_OFFLINE \
+            CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE; do
+            if [[ -v "${name}" ]]; then
+              keep+=("${name}=${!name}")
+            fi
+          done
+          offline=(unshare --user --map-current-user --net -- env -i "${keep[@]}")
+          if [[ "$("${offline[@]}" id -u)" != "$(id -u)" ]]; then
+            echo "::error::unshare did not keep the runner's user id" >&2
+            exit 1
+          fi
+          # Fail if anything beyond the kept variables reaches the tests.
+          extra="$("${offline[@]}" env | cut -d= -f1 | grep -vxF -f <(printf '%s\n' "${keep[@]%%=*}") || true)"
+          if [[ -n "${extra}" ]]; then
+            echo "::error::the test environment is not empty beyond the kept variables" >&2
+            printf '%s\n' "${extra}" >&2
+            exit 1
+          fi
           read -r -a crates <<< "${LINUX_CRATES}"
           skips=(
             --skip image::tests::parses_own_test_binary
