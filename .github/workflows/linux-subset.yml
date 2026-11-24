@@ -85,18 +85,27 @@ jobs:
       # (via the runner's preinstalled shellcheck) the `run:` scripts, which
       # YAML parsing alone never checks. The release is pinned and its
       # checksum verified, like the actions above.
+      # actionlint silently skips the shell checks when shellcheck is not on
+      # PATH, so a runner image without it would pass every `run:` script
+      # unchecked. Fail instead, and pass the binary explicitly so the check
+      # cannot be dropped by a PATH change. pyflakes is off: no step runs Python.
       - name: actionlint
         env:
           ACTIONLINT_VERSION: 1.7.7
           ACTIONLINT_SHA256: 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
         run: |
+          if ! shellcheck_bin="$(command -v shellcheck)"; then
+            echo "::error::shellcheck is not installed; actionlint would skip the run: scripts"
+            exit 1
+          fi
+          "$shellcheck_bin" --version
           tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
           cd "$RUNNER_TEMP"
           curl -sSfL --retry 3 -O "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
           echo "${ACTIONLINT_SHA256}  ${tarball}" | sha256sum -c -
           tar xzf "$tarball" actionlint
           cd "$GITHUB_WORKSPACE"
-          "$RUNNER_TEMP/actionlint" -color
+          "$RUNNER_TEMP/actionlint" -color -shellcheck="$shellcheck_bin" -pyflakes=
 
       # Security audit of the workflows, which actionlint does not do:
       # template injection in `run:` scripts, credentials persisted by
