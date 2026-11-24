@@ -181,7 +181,12 @@ jobs:
       # ("keep the two in step"); fail when the copies drift apart. cargo
       # metadata does not report lints, so the manifests are read with the
       # runner's Python 3 tomllib (-I: no site packages, no cwd on sys.path).
-      - name: Workspace lints apply everywhere
+      # The same goes for the [workspace.package] fields every member
+      # inherits today: a member that spells out its own `edition` (or
+      # `license`, `publish`) instead of `.workspace = true` drifts unseen
+      # when the root one is bumped, so each must be inherited, and the
+      # fixture's hand-written copies must match the root's.
+      - name: Workspace lints and package fields apply everywhere
         run: |
           metadata="$(cargo metadata --locked --no-deps --format-version 1)"
           manifests="$(jq -r '.packages[].manifest_path' <<< "${metadata}")"
@@ -195,7 +200,13 @@ jobs:
 
           root, fixture, *members = sys.argv[1:]
           want = load(root).get("workspace", {}).get("lints")
+          inherited = ("edition", "license", "publish")
+          root_package = load(root).get("workspace", {}).get("package", {})
           failed = False
+          for key in inherited:
+              if key not in root_package:
+                  print(f"::error::root Cargo.toml has no [workspace.package] {key}", file=sys.stderr)
+                  failed = True
           if not want:
               print("::error::root Cargo.toml has no [workspace.lints]", file=sys.stderr)
               failed = True
@@ -203,15 +214,27 @@ jobs:
               print("::error::cargo metadata listed no workspace members", file=sys.stderr)
               failed = True
           for m in members:
-              if load(m).get("lints") != {"workspace": True}:
+              manifest = load(m)
+              if manifest.get("lints") != {"workspace": True}:
                   print(f"::error file={m}::[lints] must be exactly `workspace = true`", file=sys.stderr)
                   failed = True
-          if load(fixture).get("lints") != want:
+              package = manifest.get("package", {})
+              for key in inherited:
+                  if package.get(key) != {"workspace": True}:
+                      print(f"::error file={m}::[package] {key} must be `{key}.workspace = true`", file=sys.stderr)
+                      failed = True
+          fixture_manifest = load(fixture)
+          if fixture_manifest.get("lints") != want:
               print(f"::error file={fixture}::[lints] differs from the root [workspace.lints]", file=sys.stderr)
               failed = True
+          fixture_package = fixture_manifest.get("package", {})
+          for key in inherited:
+              if fixture_package.get(key) != root_package.get(key):
+                  print(f"::error file={fixture}::[package] {key} differs from the root [workspace.package] {key}", file=sys.stderr)
+                  failed = True
           if failed:
               sys.exit(1)
-          print(f"Workspace lints on {len(members)} members and the hle-probe fixture")
+          print(f"Workspace lints and {', '.join(inherited)} on {len(members)} members and the hle-probe fixture")
           EOF
 
       # .gitattributes stores every text file with LF (`text=auto eol=lf`;
