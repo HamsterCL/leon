@@ -46,10 +46,12 @@ env:
   LINUX_CRATES: >-
     -p victory-core -p victory-pe -p victory-formats -p victory-pipeline
     -p victory-game -p victory-loader -p victory-shader -p xtask
-  # Crates that are clippy-clean for the Windows target today.
+  # Crates that are clippy-clean for the Windows target today: every
+  # workspace member but xtask, which is host-only.
   WINDOWS_CLIPPY_CRATES: >-
     -p victory-core -p victory-pe -p victory-formats -p victory-pipeline
     -p victory-game -p victory-loader -p victory-shader -p victory-gpu
+    -p victory-hle -p victory
   # Packages that are rustfmt-clean today. The rest (victory-formats,
   # victory-loader, victory-gpu, victory-hle) are not yet; add each one
   # once it is, and switch to `cargo fmt --all --check` when all are.
@@ -254,18 +256,7 @@ jobs:
           read -r -a crates <<< "${WINDOWS_CLIPPY_CRATES}"
           cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc "${crates[@]}" -- -D warnings
 
-      # victory-hle and apps/victory are clippy-clean for Windows but for one
-      # field_reassign_with_default in victory-hle's xmem.rs (fixed in open
-      # PRs #355/#405). Lint them with only that lint allowed, so nothing else
-      # regresses meanwhile; once it is fixed, drop the -A and move both into
-      # WINDOWS_CLIPPY_CRATES. Both feature sets: the `diagnostics` code here
-      # is cfg(windows).
-      - name: clippy (Windows target, victory-hle and apps/victory)
-        run: |
-          cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc -p victory-hle -p victory -- -D warnings -A clippy::field_reassign_with_default
-          cargo clippy --locked --all-targets --all-features --target x86_64-pc-windows-msvc -p victory-hle -p victory -- -D warnings -A clippy::field_reassign_with_default
-
-      # Same as the two steps above with every feature on, so the
+      # Same as the step above with every feature on, so the
       # `diagnostics` code (frame capture, the host debug layer, scripted keys,
       # mostly cfg(windows)) is compiled and linted too. Both builds stay: some
       # code is cfg(not(feature = "diagnostics")).
