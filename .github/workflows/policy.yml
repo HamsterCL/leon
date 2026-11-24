@@ -27,7 +27,6 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.98.1
           components: rustfmt
 
       - name: Verify Asset Policy (Rule #1)
