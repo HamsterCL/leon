@@ -339,6 +339,22 @@ jobs:
           cargo test --locked --no-fail-fast "${crates[@]}" -- --exact "${skips[@]}"
           cargo test --locked --no-fail-fast --all-features "${crates[@]}" -- --exact "${skips[@]}"
 
+      # Builds, build scripts and tests must leave the checkout as they found
+      # it: a test writing scratch files into the source tree (instead of a
+      # temp dir), a build script regenerating a tracked file, or rustfmt or
+      # xtask rewriting something would otherwise pass here and dirty every
+      # contributor's tree. Untracked files count too; ignored ones (target/)
+      # do not. --locked already covers Cargo.lock.
+      - name: Checkout unchanged by the steps above
+        run: |
+          changes="$(git status --porcelain=v1 --untracked-files=all)"
+          if [[ -n "${changes}" ]]; then
+            echo "::error::the steps above modified or created files in the checkout" >&2
+            printf '%s\n' "${changes}" >&2
+            git diff --stat >&2
+            exit 1
+          fi
+
   # Type-checks the Windows build from Linux: no MSVC, no linking, nothing runs.
   # Catches compile errors in cfg(windows) code (most of victory-gpu,
   # victory-hle and apps/victory, and the Windows-only tests) that the job
