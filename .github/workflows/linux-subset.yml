@@ -71,7 +71,11 @@ env:
     -p victory-hle -p victory-shader -p victory-gpu -p victory
 
 jobs:
+  # Each job's name repeats its id, so the check names that branch protection
+  # requires stay `linux` and `windows-target-check`; zizmor's pedantic
+  # persona (below) flags unnamed jobs.
   linux:
+    name: linux
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -141,6 +145,8 @@ jobs:
       # SHA really is a commit of the action's repository (impostor commits)
       # and that no pinned version has a known advisory. Pinned and
       # checksum-verified like actionlint; exits non-zero on any finding.
+      # The pedantic persona adds the code-quality audits the default one
+      # hides (unnamed jobs, ...); every one of them passes today.
       - name: zizmor
         env:
           ZIZMOR_VERSION: 1.32.0
@@ -153,7 +159,7 @@ jobs:
           echo "${ZIZMOR_SHA256}  ${tarball}" | sha256sum -c -
           tar xzf "${tarball}" zizmor
           cd "${GITHUB_WORKSPACE}"
-          "${RUNNER_TEMP}/zizmor" --color=always .github/workflows
+          "${RUNNER_TEMP}/zizmor" --color=always --persona=pedantic .github/workflows
 
       # Fast, needs no build: keep the clean packages clean. load_probe.rs is
       # checked by itself, since the rest of victory-loader is not clean yet.
@@ -212,6 +218,7 @@ jobs:
   # victory-hle and apps/victory, and the Windows-only tests) that the job
   # above never compiles.
   windows-target-check:
+    name: windows-target-check
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
