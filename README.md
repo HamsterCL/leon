@@ -230,6 +230,10 @@ not have it, and it scales with the window: twice as big from 1440 lines.
 `victory_profile`'s documentation lists the other hooks (`count!`,
 `cache!`, `resident!`, `load`).
 
+[docs/debugging-notes-from-a-gta-v-port.md](docs/debugging-notes-from-a-gta-v-port.md)
+collects what got another RAGE port from "the world loads" to "the game
+runs": what the title waited for, and how each wait was found.
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
