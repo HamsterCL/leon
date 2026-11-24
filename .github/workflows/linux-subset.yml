@@ -18,10 +18,13 @@ permissions:
 # is ignored. Set it once so every `run:` script gets pipefail, plus nounset:
 # a misspelt or missing variable (say a renamed *_CRATES list) is an error
 # instead of expanding to nothing, which would e.g. run `cargo clippy` with
-# no -p flags on whatever the default members are.
+# no -p flags on whatever the default members are. inherit_errexit makes
+# `set -e` apply inside command substitutions too, which Bash otherwise
+# resets there: a failing command in `x="$(a; b)"` stops the step instead
+# of letting `b` run on.
 defaults:
   run:
-    shell: bash --noprofile --norc -euo pipefail {0}
+    shell: bash --noprofile --norc -O inherit_errexit -euo pipefail {0}
 
 # Actions are pinned to full commit SHAs (tag in the trailing comment): a tag
 # can be moved to other code, a commit cannot. Bump both together.
@@ -99,6 +102,8 @@ jobs:
       # instead: the same checks run on every runner image, and a missing
       # binary fails the step rather than skipping the checks. Both releases
       # are pinned and their checksums verified, like the actions above.
+      # Every download (here and in zizmor below) is HTTPS-only, redirects
+      # included (--proto =https), with TLS 1.2 or newer.
       # pyflakes is off: no step runs Python.
       # SHELLCHECK_OPTS turns on ShellCheck's optional checks (masked return
       # codes, `set -e` suppressed in functions, unassigned uppercase vars,
@@ -117,13 +122,13 @@ jobs:
         run: |
           cd "${RUNNER_TEMP}"
           sc_tarball="shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
-          curl -sSfL --retry 3 -O "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/${sc_tarball}"
+          curl -sSfL --proto =https --tlsv1.2 --retry 3 -O "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/${sc_tarball}"
           echo "${SHELLCHECK_SHA256}  ${sc_tarball}" | sha256sum -c -
           tar xJf "${sc_tarball}" --strip-components=1 "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
           shellcheck_bin="${RUNNER_TEMP}/shellcheck"
           "${shellcheck_bin}" --version
           tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
-          curl -sSfL --retry 3 -O "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
+          curl -sSfL --proto =https --tlsv1.2 --retry 3 -O "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
           echo "${ACTIONLINT_SHA256}  ${tarball}" | sha256sum -c -
           tar xzf "${tarball}" actionlint
           cd "${GITHUB_WORKSPACE}"
@@ -144,7 +149,7 @@ jobs:
         run: |
           tarball="zizmor-x86_64-unknown-linux-gnu.tar.gz"
           cd "${RUNNER_TEMP}"
-          curl -sSfL --retry 3 -O "https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/${tarball}"
+          curl -sSfL --proto =https --tlsv1.2 --retry 3 -O "https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/${tarball}"
           echo "${ZIZMOR_SHA256}  ${tarball}" | sha256sum -c -
           tar xzf "${tarball}" zizmor
           cd "${GITHUB_WORKSPACE}"
