@@ -384,8 +384,9 @@ jobs:
       # it: a test writing scratch files into the source tree (instead of a
       # temp dir), a build script regenerating a tracked file, or rustfmt or
       # xtask rewriting something would otherwise pass here and dirty every
-      # contributor's tree. Untracked files count too; ignored ones (target/)
-      # do not. --locked already covers Cargo.lock.
+      # contributor's tree. Untracked files count too, and so do ignored ones
+      # (a test's scratch.bin), except the build output in target/ and a
+      # fixture's target/. --locked already covers Cargo.lock.
       - name: Checkout unchanged by the steps above
         run: |
           changes="$(git status --porcelain=v1 --untracked-files=all)"
@@ -393,6 +394,24 @@ jobs:
             echo "::error::the steps above modified or created files in the checkout" >&2
             printf '%s\n' "${changes}" >&2
             git diff --stat >&2
+            exit 1
+          fi
+          # .gitignore hides *.bin, *.dll, *.dat, ... from `git status`, so a
+          # scratch file of those kinds would pass the check above. List the
+          # ignored files too (whole ignored directories collapse to one
+          # entry) and allow only the build output directories.
+          list="${RUNNER_TEMP}/ignored-files"
+          git ls-files -z --others --ignored --exclude-standard --directory > "${list}"
+          mapfile -d '' -t ignored < "${list}"
+          stray=()
+          for f in "${ignored[@]}"; do
+            if [[ "${f}" != target/ && ! "${f}" =~ ^tests/fixtures/[^/]+/target/$ ]]; then
+              stray+=("${f}")
+            fi
+          done
+          if [[ "${#stray[@]}" -ne 0 ]]; then
+            echo "::error::the steps above created ignored files outside target/" >&2
+            printf '%s\n' "${stray[@]}" >&2
             exit 1
           fi
 
@@ -482,9 +501,9 @@ jobs:
 
       # As in the linux job: the Windows-target builds (the workspace's and the
       # hle-probe fixture's, build scripts included) must leave the checkout as
-      # they found it. Ignored output (target/, the fixture's target/) does not
-      # count; anything else, tracked or untracked, fails. The fixture's
-      # --locked steps already cover its own Cargo.lock.
+      # they found it. Build output (target/, the fixture's target/) does not
+      # count; anything else, tracked, untracked or ignored, fails. The
+      # fixture's --locked steps already cover its own Cargo.lock.
       - name: Checkout unchanged by the steps above
         run: |
           changes="$(git status --porcelain=v1 --untracked-files=all)"
@@ -492,5 +511,23 @@ jobs:
             echo "::error::the steps above modified or created files in the checkout" >&2
             printf '%s\n' "${changes}" >&2
             git diff --stat >&2
+            exit 1
+          fi
+          # .gitignore hides *.bin, *.dll, *.dat, ... from `git status`, so a
+          # scratch file of those kinds would pass the check above. List the
+          # ignored files too (whole ignored directories collapse to one
+          # entry) and allow only the build output directories.
+          list="${RUNNER_TEMP}/ignored-files"
+          git ls-files -z --others --ignored --exclude-standard --directory > "${list}"
+          mapfile -d '' -t ignored < "${list}"
+          stray=()
+          for f in "${ignored[@]}"; do
+            if [[ "${f}" != target/ && ! "${f}" =~ ^tests/fixtures/[^/]+/target/$ ]]; then
+              stray+=("${f}")
+            fi
+          done
+          if [[ "${#stray[@]}" -ne 0 ]]; then
+            echo "::error::the steps above created ignored files outside target/" >&2
+            printf '%s\n' "${stray[@]}" >&2
             exit 1
           fi
