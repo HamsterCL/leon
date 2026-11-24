@@ -13,13 +13,15 @@ on:
 permissions:
   contents: read
 
-# An explicit `shell: bash` runs scripts as `bash --noprofile --norc -eo
-# pipefail`; the implicit default is plain `bash -e`, where a failing command
-# on the left of a pipe (e.g. the `echo ... | sha256sum -c -` checksum checks)
-# is ignored. Set it once so every `run:` script gets pipefail.
+# The implicit default shell is plain `bash -e`, where a failing command on
+# the left of a pipe (e.g. the `echo ... | sha256sum -c -` checksum checks)
+# is ignored. Set it once so every `run:` script gets pipefail, plus nounset:
+# a misspelt or missing variable (say a renamed *_CRATES list) is an error
+# instead of expanding to nothing, which would e.g. run `cargo clippy` with
+# no -p flags on whatever the default members are.
 defaults:
   run:
-    shell: bash
+    shell: bash --noprofile --norc -euo pipefail {0}
 
 # Actions are pinned to full commit SHAs (tag in the trailing comment): a tag
 # can be moved to other code, a commit cannot. Bump both together.
@@ -99,12 +101,13 @@ jobs:
       # cannot be dropped by a PATH change. pyflakes is off: no step runs Python.
       # SHELLCHECK_OPTS turns on ShellCheck's optional checks (masked return
       # codes, `set -e` suppressed in functions, unassigned uppercase vars,
-      # `[[ ]]` over `[ ]`, ...) for the `run:` scripts. All of them pass
-      # today but require-variable-braces (SC2250), which is style only.
+      # `[[ ]]` over `[ ]`, `${var}` over `$var`, ...) for the `run:` scripts.
+      # Every optional check is listed and passes; they are named rather than
+      # `--enable=all` so a newer runner shellcheck cannot add one unseen.
       - name: actionlint
         env:
           SHELLCHECK_OPTS: >-
-            --enable=add-default-case,avoid-nullary-conditions,check-extra-masked-returns,check-set-e-suppressed,check-unassigned-uppercase,deprecate-which,quote-safe-variables,require-double-brackets
+            --enable=add-default-case,avoid-nullary-conditions,check-extra-masked-returns,check-set-e-suppressed,check-unassigned-uppercase,deprecate-which,quote-safe-variables,require-double-brackets,require-variable-braces
           ACTIONLINT_VERSION: 1.7.7
           ACTIONLINT_SHA256: 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
         run: |
@@ -112,14 +115,14 @@ jobs:
             echo "::error::shellcheck is not installed; actionlint would skip the run: scripts"
             exit 1
           fi
-          "$shellcheck_bin" --version
+          "${shellcheck_bin}" --version
           tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
-          cd "$RUNNER_TEMP"
+          cd "${RUNNER_TEMP}"
           curl -sSfL --retry 3 -O "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
           echo "${ACTIONLINT_SHA256}  ${tarball}" | sha256sum -c -
-          tar xzf "$tarball" actionlint
-          cd "$GITHUB_WORKSPACE"
-          "$RUNNER_TEMP/actionlint" -color -shellcheck="$shellcheck_bin" -pyflakes=
+          tar xzf "${tarball}" actionlint
+          cd "${GITHUB_WORKSPACE}"
+          "${RUNNER_TEMP}/actionlint" -color -shellcheck="${shellcheck_bin}" -pyflakes=
 
       # Security audit of the workflows, which actionlint does not do:
       # template injection in `run:` scripts, credentials persisted by
@@ -135,24 +138,24 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tarball="zizmor-x86_64-unknown-linux-gnu.tar.gz"
-          cd "$RUNNER_TEMP"
+          cd "${RUNNER_TEMP}"
           curl -sSfL --retry 3 -O "https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/${tarball}"
           echo "${ZIZMOR_SHA256}  ${tarball}" | sha256sum -c -
-          tar xzf "$tarball" zizmor
-          cd "$GITHUB_WORKSPACE"
-          "$RUNNER_TEMP/zizmor" --color=always .github/workflows
+          tar xzf "${tarball}" zizmor
+          cd "${GITHUB_WORKSPACE}"
+          "${RUNNER_TEMP}/zizmor" --color=always .github/workflows
 
       # Fast, needs no build: keep the clean packages clean. load_probe.rs is
       # checked by itself, since the rest of victory-loader is not clean yet.
       - name: rustfmt (clean packages)
         run: |
-          read -r -a crates <<< "$RUSTFMT_CRATES"
+          read -r -a crates <<< "${RUSTFMT_CRATES}"
           cargo fmt --check "${crates[@]}"
           rustfmt --check --edition 2024 crates/victory-loader/tests/load_probe.rs
 
       - name: clippy (all targets)
         run: |
-          read -r -a crates <<< "$LINUX_CRATES"
+          read -r -a crates <<< "${LINUX_CRATES}"
           cargo clippy --all-targets --locked "${crates[@]}" -- -D warnings
 
       # The steps above build default features only, so code behind the
@@ -160,7 +163,7 @@ jobs:
       # Lint it too. Both builds stay: some code is cfg(not(feature = ...)).
       - name: clippy (all features)
         run: |
-          read -r -a crates <<< "$LINUX_CRATES"
+          read -r -a crates <<< "${LINUX_CRATES}"
           cargo clippy --all-targets --all-features --locked "${crates[@]}" -- -D warnings
 
       # Doc tests run under `cargo test` below, but rustdoc's own lints (a
@@ -174,7 +177,7 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: |
-          read -r -a crates <<< "$RUSTDOC_CRATES"
+          read -r -a crates <<< "${RUSTDOC_CRATES}"
           cargo doc --no-deps --locked --document-private-items "${crates[@]}"
           cargo doc --no-deps --locked --document-private-items --all-features "${crates[@]}"
 
@@ -184,7 +187,7 @@ jobs:
       # --no-fail-fast: report failures from every test binary, not the first.
       - name: cargo test
         run: |
-          read -r -a crates <<< "$LINUX_CRATES"
+          read -r -a crates <<< "${LINUX_CRATES}"
           cargo test --locked --no-fail-fast "${crates[@]}" -- --exact \
             --skip image::tests::parses_own_test_binary \
             --skip image::tests::rva_to_file_offset_maps_entry_point \
@@ -231,7 +234,7 @@ jobs:
 
       - name: clippy (Windows target, clean crates)
         run: |
-          read -r -a crates <<< "$WINDOWS_CLIPPY_CRATES"
+          read -r -a crates <<< "${WINDOWS_CLIPPY_CRATES}"
           cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc "${crates[@]}" -- -D warnings
 
       # victory-hle and apps/victory are clippy-clean for Windows but for one
@@ -251,7 +254,7 @@ jobs:
       # code is cfg(not(feature = "diagnostics")).
       - name: cargo check + clippy (Windows target, all features)
         run: |
-          read -r -a crates <<< "$WINDOWS_CLIPPY_CRATES"
+          read -r -a crates <<< "${WINDOWS_CLIPPY_CRATES}"
           cargo check --locked --workspace --all-targets --all-features --target x86_64-pc-windows-msvc
           cargo clippy --locked --all-targets --all-features --target x86_64-pc-windows-msvc "${crates[@]}" -- -D warnings
 
@@ -273,7 +276,7 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: |
-          read -r -a crates <<< "$WINDOWS_RUSTDOC_CRATES"
+          read -r -a crates <<< "${WINDOWS_RUSTDOC_CRATES}"
           cargo doc --no-deps --locked --document-private-items --target x86_64-pc-windows-msvc "${crates[@]}"
           cargo doc --no-deps --locked --document-private-items --all-features --target x86_64-pc-windows-msvc "${crates[@]}"
           cargo doc --no-deps --locked --document-private-items --target x86_64-pc-windows-msvc --manifest-path tests/fixtures/hle-probe/Cargo.toml
