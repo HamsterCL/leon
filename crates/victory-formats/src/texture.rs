@@ -423,9 +423,9 @@ impl Layout {
             for i in 0..d.mips {
                 let (w, h) = padded(i);
                 let depth = mip_depth(i);
-                // A thick tail must fit in the first depth slab.
-                if w <= fixed[0] && h <= fixed[1] && depth <= fixed[2] && d.mips - i <= max_in_tail
-                {
+                // addrlib's `mipChainInTail` looks at width and height only: a
+                // deep volume keeps the chain in the tail of each depth slab.
+                if w <= fixed[0] && h <= fixed[1] && d.mips - i <= max_in_tail {
                     first_tail_mip = i;
                     slice_size += block_bytes / u64::from(block[2]);
                     break;
@@ -1289,10 +1289,12 @@ mod tests {
             (16, 32, 16, 4, Swizzle::SW_64KB_S, 0),
             (17, 32, 16, 4, Swizzle::SW_64KB_S, 1),
             (16, 33, 16, 4, Swizzle::SW_64KB_S, 1),
-            (16, 16, 64, 4, Swizzle::SW_64KB_S, 2),
-            (16, 16, 65, 4, Swizzle::SW_64KB_S, 3),
-            (16, 16, 64, 2, Swizzle::SW_64KB_S, 2),
-            (8, 8, 17, 4, Swizzle::SW_4KB_S, 2),
+            // Depth does not move it: addrlib's `mipChainInTail` looks at
+            // width and height only (see `layouts_match_addrlib`).
+            (16, 16, 64, 4, Swizzle::SW_64KB_S, 0),
+            (16, 16, 65, 4, Swizzle::SW_64KB_S, 0),
+            (16, 16, 64, 2, Swizzle::SW_64KB_S, 0),
+            (8, 8, 17, 4, Swizzle::SW_4KB_S, 0),
         ] {
             let d = Desc {
                 dimension: Dimension::Tex3d,
@@ -1310,45 +1312,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn thick_tail_offsets_and_depth_slabs() {
-        let l = Layout::new(&Desc {
-            dimension: Dimension::Tex3d,
-            depth: 64,
-            ..desc(16, 16, 4, 4, Swizzle::SW_64KB_S)
-        })
-        .unwrap();
-        let block_bytes = 65536;
-        assert_eq!(l.block, [32, 32, 16]);
-        assert_eq!(
-            (l.slices, l.slice_size, l.size),
-            (4, 3 * block_bytes, 12 * block_bytes)
-        );
-        assert_eq!(l.mips[0].offset, 2 * block_bytes);
-        assert_eq!(l.mips[1].offset, block_bytes);
-        assert_eq!(l.mips[2].offset, 0);
-        assert_eq!(l.mips[3].offset, 0);
-        assert_eq!(
-            l.mips[2].tail,
-            Some(Tail {
-                offset: 8192,
-                x: 16,
-                y: 0
-            })
-        );
-        assert_eq!(
-            l.mips[3].tail,
-            Some(Tail {
-                offset: 4096,
-                x: 0,
-                y: 16
-            })
-        );
-        assert_eq!(l.offset(0, 0, 0, 16), Ok(5 * block_bytes));
-        assert_eq!(l.offset(2, 0, 0, 0), Ok(32768));
-        assert_eq!(l.offset(3, 0, 0, 0), Ok(16384));
     }
 
     #[test]
