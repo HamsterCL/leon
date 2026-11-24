@@ -551,6 +551,21 @@ jobs:
           read -r -a crates <<< "${LINUX_CRATES}"
           cargo clippy --all-targets --all-features --locked "${crates[@]}" -- -D warnings
 
+      # Every step builds its crates together, so Cargo unifies their
+      # features: a crate that uses a dependency's feature (one of serde's,
+      # object's, windows-sys's, ...) without enabling it in its own
+      # Cargo.toml still builds, because a sibling enables it, and breaks only
+      # when built alone (`cargo test -p` it, or a downstream user). Check
+      # each crate by itself, with default features and with all of its own.
+      # Lints stay with clippy above; this only fails on build errors.
+      - name: cargo check (each crate on its own)
+        run: |
+          read -r -a crates <<< "${LINUX_CRATES}"
+          for ((i = 1; i < ${#crates[@]}; i += 2)); do
+            cargo check --locked --quiet --all-targets -p "${crates[i]}"
+            cargo check --locked --quiet --all-targets --all-features -p "${crates[i]}"
+          done
+
       # Doc tests run under `cargo test` below, but rustdoc's own lints (a
       # renamed item leaving a dangling [`link`], a public doc linking to a
       # private item) only fire when the docs are built. Private items are
@@ -678,6 +693,18 @@ jobs:
           read -r -a crates <<< "${WINDOWS_CLIPPY_CRATES}"
           cargo check --locked --workspace --all-targets --all-features --target x86_64-pc-windows-msvc
           cargo clippy --locked --all-targets --all-features --target x86_64-pc-windows-msvc "${crates[@]}" -- -D warnings
+
+      # As the Linux job's per-crate step: the steps above unify features
+      # across the workspace, so a crate missing a feature it uses on a
+      # dependency (windows-sys's Win32_* features most of all) still builds.
+      # Check each one by itself. RUSTFLAGS above makes warnings fail too.
+      - name: cargo check (Windows target, each crate on its own)
+        run: |
+          read -r -a crates <<< "${WINDOWS_CLIPPY_CRATES}"
+          for ((i = 1; i < ${#crates[@]}; i += 2)); do
+            cargo check --locked --quiet --all-targets --target x86_64-pc-windows-msvc -p "${crates[i]}"
+            cargo check --locked --quiet --all-targets --all-features --target x86_64-pc-windows-msvc -p "${crates[i]}"
+          done
 
       # The hle-probe fixture is outside the workspace (load_probe builds it on
       # demand on Windows), so the steps above never compile it. It is
