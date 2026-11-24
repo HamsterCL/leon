@@ -237,6 +237,73 @@ jobs:
           print(f"Workspace lints and {', '.join(inherited)} on {len(members)} members and the hle-probe fixture")
           EOF
 
+      # Every dependency today is a checksummed crates.io release. A git
+      # dependency (or a `[patch]` pointing at one), a path dependency outside
+      # the repository, or a crate from another registry or a source
+      # replacement would build and pass every step here, while pulling code
+      # that is neither checksummed nor reviewable from Cargo.lock, so fail on
+      # one instead. Both lockfiles are read with tomllib, without the
+      # network: each package must either have no source and be a workspace
+      # member (the fixture's lock: the fixture itself), or come from the
+      # crates.io index with a checksum. The root manifest and the cargo
+      # config must not redirect sources with [patch], [replace], [source]
+      # or [registries].
+      - name: Dependencies come only from crates.io
+        run: |
+          metadata="$(cargo metadata --locked --no-deps --format-version 1)"
+          names="$(jq -r '.packages[].name' <<< "${metadata}")"
+          mapfile -t members <<< "${names}"
+          python3 -I - "${members[@]}" <<'EOF'
+          import sys, tomllib
+
+          def load(path):
+              with open(path, "rb") as f:
+                  return tomllib.load(f)
+
+          crates_io = {
+              "registry+https://github.com/rust-lang/crates.io-index",
+              "sparse+https://index.crates.io/",
+          }
+          members = set(sys.argv[1:])
+          failed = False
+          if len(members) < 2:
+              print("::error::cargo metadata listed no workspace members", file=sys.stderr)
+              failed = True
+          fixture = "tests/fixtures/hle-probe"
+          fixture_name = load(f"{fixture}/Cargo.toml")["package"]["name"]
+          counted = 0
+          for lock, local in (("Cargo.lock", members), (f"{fixture}/Cargo.lock", {fixture_name})):
+              packages = load(lock).get("package", [])
+              if not packages:
+                  print(f"::error file={lock}::no [[package]] entries", file=sys.stderr)
+                  failed = True
+              for p in packages:
+                  counted += 1
+                  name, source = p["name"], p.get("source")
+                  if source is None:
+                      if name not in local:
+                          print(f"::error file={lock}::{name} has no source but is not a workspace member (path dependency outside the workspace?)", file=sys.stderr)
+                          failed = True
+                  elif source not in crates_io:
+                      print(f"::error file={lock}::{name} comes from {source}, not crates.io", file=sys.stderr)
+                      failed = True
+                  elif not p.get("checksum"):
+                      print(f"::error file={lock}::{name} from crates.io has no checksum", file=sys.stderr)
+                      failed = True
+          for path, keys in (
+              ("Cargo.toml", ("patch", "replace")),
+              (f"{fixture}/Cargo.toml", ("patch", "replace")),
+              (".cargo/config.toml", ("patch", "source", "registries")),
+          ):
+              found = [k for k in keys if k in load(path)]
+              if found:
+                  print(f"::error file={path}::redirects dependency sources with [{'], ['.join(found)}]", file=sys.stderr)
+                  failed = True
+          if failed:
+              sys.exit(1)
+          print(f"{counted} locked packages: workspace members or checksummed crates.io releases")
+          EOF
+
       # .gitattributes stores every text file with LF (`text=auto eol=lf`;
       # *.cmd and *.ps1 get CRLF only in the working tree). That applies only
       # when git normalises the file at `git add`: a file committed with
