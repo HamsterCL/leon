@@ -2021,11 +2021,12 @@ mod tests {
         let d = unsafe { b5g5r5a1.GetDesc() };
         assert_eq!(
             d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0,
-            supports(86, D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)
+            supports(86, D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) || widened(86)
         );
+        // A format the host cannot render to is widened instead, and keeps the flag.
         assert_eq!(
             d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 != 0,
-            supports(86, D3D12_FORMAT_SUPPORT1_RENDER_TARGET)
+            supports(86, D3D12_FORMAT_SUPPORT1_RENDER_TARGET) || widened(86)
         );
 
         // B4G4R4A4_UNORM (115) with ALLOW_RENDER_TARGET (1) and a non-null
@@ -2039,7 +2040,7 @@ mod tests {
         let bd = unsafe { b4g4r4a4.GetDesc() };
         assert_eq!(
             bd.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 != 0,
-            supports(115, D3D12_FORMAT_SUPPORT1_RENDER_TARGET)
+            supports(115, D3D12_FORMAT_SUPPORT1_RENDER_TARGET) || widened(115)
         );
 
         // R8G8B8A8_TYPELESS (27) with flags=5 must keep ALLOW_UNORDERED_ACCESS.
