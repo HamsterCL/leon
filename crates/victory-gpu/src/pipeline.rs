@@ -116,6 +116,18 @@ impl Shader {
             .get_or_init(|| {
                 victory_profile::scope!("shader", "translate", self.container.len());
                 let done = translate(&self.container);
+                // Diagnostics: `VICTORY_SHADER_DUMP=<dir>` keeps each
+                // container and its DXIL as `<hash>.bin` / `<hash>.dxil`.
+                #[cfg(feature = "diagnostics")]
+                if let Some(dir) = std::env::var_os("VICTORY_SHADER_DUMP") {
+                    let dir = std::path::PathBuf::from(dir);
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::fs::write(dir.join(format!("{}.bin", self.hash)), &self.container);
+                    if let Ok(t) = &done {
+                        let _ =
+                            std::fs::write(dir.join(format!("{}.dxil", self.hash)), &t.host.dxil);
+                    }
+                }
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
