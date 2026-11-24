@@ -255,7 +255,15 @@ jobs:
       # rustfmt skips) pick up whitespace-only diff noise unseen. Both are
       # read from the index (`git grep --cached`, the `--eol` list), so a
       # CRLF working-tree copy (*.cmd, *.ps1) cannot trip or hide either.
-      - name: LF line endings, no conflict markers, no stray whitespace
+      # A UTF-8 byte-order mark (U+FEFF, which Notepad and some Visual Studio
+      # setups write) is invisible in an editor and in a diff, but it is not
+      # whitespace to the check above: at the top of a file it hides a
+      # script's `#!` line (the kernel, the file-mode step below and the
+      # ShellCheck list all look for `#!` at byte 0) and shows as a mystery
+      # first-line change in review. Mid-file it is a stray zero-width
+      # character. Fail on it anywhere in a tracked text file; Rust source
+      # that needs the character can spell it `\u{feff}`.
+      - name: LF line endings, no conflict markers, no stray whitespace or BOMs
         run: |
           list="${RUNNER_TEMP}/eol"
           git ls-files -z --eol > "${list}"
@@ -290,6 +298,13 @@ jobs:
           if [[ -n "${trailing}" ]]; then
             echo "::error::trailing spaces or tabs in tracked files" >&2
             printf '%s\n' "${trailing}" >&2
+            exit 1
+          fi
+          # git grep exits 1 when nothing matches; any other failure stops.
+          bom="$(git grep --cached -nIF -e $'\xEF\xBB\xBF')" || [[ $? -eq 1 ]]
+          if [[ -n "${bom}" ]]; then
+            echo "::error::UTF-8 byte-order marks (U+FEFF) in tracked text files" >&2
+            printf '%s\n' "${bom}" >&2
             exit 1
           fi
           # git grep exits 1 when nothing matches; any other failure stops.
