@@ -214,6 +214,42 @@ jobs:
           print(f"Workspace lints on {len(members)} members and the hle-probe fixture")
           EOF
 
+      # .gitattributes stores every text file with LF (`text=auto eol=lf`;
+      # *.cmd and *.ps1 get CRLF only in the working tree). That applies only
+      # when git normalises the file at `git add`: a file committed with
+      # core.autocrlf=false from a Windows editor, or one added before the
+      # attribute, keeps its CRLFs in the index, and every Linux checkout
+      # then shows it modified. Fail on any tracked file whose stored copy
+      # has CRLF or mixed endings (`git ls-files --eol`, index column).
+      # Merge-conflict markers left in a resolved file do not always break
+      # the build (a comment, a doc, a workflow, a fixture), so fail on those
+      # too: `<<<<<<< `, `||||||| ` or `>>>>>>> ` opening a line in any
+      # tracked text file. A bare `=======` is left alone; it is also a
+      # Markdown heading underline.
+      - name: LF line endings, no conflict markers
+        run: |
+          list="${RUNNER_TEMP}/eol"
+          git ls-files -z --eol > "${list}"
+          bad=()
+          while IFS= read -r -d '' entry; do
+            index_eol="${entry%% *}"
+            if [[ "${index_eol}" == i/crlf || "${index_eol}" == i/mixed ]]; then
+              bad+=("${entry#*$'\t'}")
+            fi
+          done < "${list}"
+          if [[ "${#bad[@]}" -ne 0 ]]; then
+            echo "::error::tracked files stored with CRLF line endings (re-add them with git add --renormalize)" >&2
+            printf '%s\n' "${bad[@]}" >&2
+            exit 1
+          fi
+          # git grep exits 1 when nothing matches; any other failure stops.
+          markers="$(git grep -nIE -e '^(<{7}|[|]{7}|>{7})( |$)')" || [[ $? -eq 1 ]]
+          if [[ -n "${markers}" ]]; then
+            echo "::error::merge-conflict markers in tracked files" >&2
+            printf '%s\n' "${markers}" >&2
+            exit 1
+          fi
+
       # Lints all workflows: expression and context typos, unknown keys, and
       # (via ShellCheck) the `run:` scripts, which YAML parsing alone never
       # checks. actionlint silently skips the shell checks when shellcheck is
