@@ -203,7 +203,7 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
 extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
 }
-extern "system" fn completed(this: This) -> u64 {
+pub(crate) extern "system" fn completed(this: This) -> u64 {
     fence(this).value.load(Ordering::Acquire)
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
@@ -215,35 +215,29 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         }
         return S_OK;
     }
-    if !event.is_null() {
-        waiters.push((value, event as usize));
-        drop(waiters);
-        watch_notify();
-        return S_OK;
-    }
-    // A null event: block until the value is reached, as D3D12 does.
-    let started = Instant::now();
-    let mut warned = Duration::ZERO;
-    while fence.value.load(Ordering::Acquire) < value {
-        waiters = fence
-            .moved
-            .wait_timeout(waiters, RECHECK)
-            .unwrap_or_else(|e| e.into_inner())
-            .0;
-        let waited = started.elapsed();
-        if waited >= warned + STALL {
-            warned = waited;
-            tracing::warn!(
-                value,
-                completed = fence.value.load(Ordering::Acquire),
-                seconds = waited.as_secs(),
-                "blocking fence wait still waiting"
-            );
+    if event.is_null() {
+        // With submissions sent to the card and not waited for
+        // (`crate::host::late`) the signal may be behind them: they are
+        // settled, which sets it.
+        #[cfg(windows)]
+        if crate::host::late() {
+            drop(waiters);
+            crate::host::settle_for_fence();
+            if fence.value.load(Ordering::Acquire) >= value {
+                return S_OK;
+            }
+            tracing::warn!(value, "blocking fence wait not implemented");
+            return E_NOTIMPL;
         }
+        // shortcut: a null event means "block until reached"; nothing can
+        // reach it while no GPU work runs, so fail instead of hanging.
+        tracing::warn!(value, "blocking fence wait not implemented");
+        return E_NOTIMPL;
     }
     S_OK
 }
-pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
+/// Moves the fence to `value` and sets the events that waited for it.
+pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
     let waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
@@ -271,108 +265,13 @@ fn wake_locked(
         }
         !reached
     });
-    let mut woken = Vec::new();
-    queues.retain(|(wanted, queue)| {
-        if *wanted <= value {
-            woken.extend(queue.upgrade());
-            moved = true;
-            false
-        } else {
-            queue.strong_count() > 0
-        }
-    });
-    (woken, moved)
 }
-
-/// Sets the events whose value the fence has reached, wakes the blocking
-/// waits and returns the queues to wake, for [`run_held`] once no fence
-/// lock is held.
-#[must_use]
-fn wake(fence: &Fence, mut waiters: MutexGuard<'_, Vec<(u64, usize)>>) -> Vec<Arc<Timeline>> {
-    let mut queues = fence.queues.lock().unwrap_or_else(|e| e.into_inner());
-    let (woken, _) = wake_locked(fence, &mut waiters, &mut queues);
-    fence.moved.notify_all();
-    woken
-}
-
-/// Runs the work queues held back until a value now reached. With no fence
-/// lock held: the work may move fences itself.
-fn run_held(queues: Vec<Arc<Timeline>>) {
-    for queue in queues {
-        queue.wake();
-    }
-}
-
-/// Queues a bottom-of-pipe write woke, to run once the writer holds no
-/// lock: their work submits lists itself (`Host::execute`'s lock).
-#[derive(Default)]
-#[must_use = "run the woken queues once no lock is held"]
-pub(crate) struct Woken(Vec<Arc<Timeline>>);
-
-impl Woken {
-    pub(crate) fn add(&mut self, other: Woken) {
-        self.0.extend(other.0);
-    }
-
-    pub(crate) fn run(self) {
-        run_held(self.0);
-    }
-}
-
-/// A reference to a fence held by a queue's work, given back on drop.
-pub(crate) struct Held(object::Held);
-
-impl Held {
-    pub(crate) fn new(this: This) -> Held {
-        Held(object::Held::new(this))
-    }
-
-    pub(crate) fn reached(&self, value: u64) -> bool {
-        fence(self.0.get()).value.load(Ordering::Acquire) >= value
-    }
-
-    pub(crate) fn signal(&self, value: u64) {
-        signal(self.0.get(), value);
-    }
-
-    /// Whether the value is reached; if not, `queue` is woken once it is.
-    /// Checked under the lock a signal takes, so no signal is missed.
-    pub(crate) fn wait_on_gpu(&self, value: u64, queue: &Arc<Timeline>) -> bool {
-        let fence = fence(self.0.get());
-        let mut queues = fence.queues.lock().unwrap_or_else(|e| e.into_inner());
-        if fence.value.load(Ordering::Acquire) >= value {
-            return true;
-        }
-        let queue = Arc::downgrade(queue);
-        if !queues.iter().any(|(v, q)| *v == value && q.ptr_eq(&queue)) {
-            queues.push((value, queue));
-        }
-        drop(queues);
-        watch_notify();
-        false
-    }
-}
-
-/// After a bottom-of-pipe write of `bytes` at `at`: wakes the waits of a
-/// fence whose value the write touched, and returns its held queues.
-pub(crate) fn written(at: usize, bytes: usize) -> Woken {
-    let end = at.saturating_add(bytes);
-    let live = live();
-    let Some((&value_at, &fence)) = live.range(..end).next_back() else {
-        return Woken::default();
-    };
-    if value_at + size_of::<u64>() <= at {
-        return Woken::default();
-    }
-    // SAFETY: registered fences are alive until their drop, which takes
-    // the registry lock we hold.
-    let fence = unsafe { &*(fence as *const Fence) };
-    let queues = wake(
-        fence,
-        fence.waiters.lock().unwrap_or_else(|e| e.into_inner()),
-    );
-    drop(live);
-    Woken(queues)
+pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
+    set(this, value);
+    // A queue may have waited for it: what it held runs now.
+    #[cfg(windows)]
+    crate::queue::release_held(false);
+    S_OK
 }
 
 extern "system" fn creation_flags(this: This) -> u32 {
@@ -464,7 +363,9 @@ mod tests {
         assert_eq!(wait(f, 5, event), S_OK, "already reached");
         // SAFETY: as above.
         assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
-        // Grand Theft Auto VI reads the value at the fence's address.
+        assert_eq!(wait(f, 9, std::ptr::null_mut()), E_NOTIMPL);
+        // The title reads the value at the fence's address.
+        let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f);
         // SAFETY: the fence's value.
         assert_eq!(unsafe { *(address(f) as *const u64) }, 5);
         // SAFETY: ours.

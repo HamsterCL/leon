@@ -11,9 +11,7 @@
 # on that machine (a D:\ path there is refused, not read as relative).
 
 [paths]
-# Your own dump of Grand Theft Auto VI.     env: VICTORY_GAME_DIR
-# It is only read: it must not be inside cache_dir, and neither cache_dir nor
-# data_dir may be inside it.
+# Your own dump of the title.     env: VICTORY_GAME_DIR
 game_dir = 'D:\victory-data\game'
 
 # Derived data. Default: %LOCALAPPDATA%\victory\cache, or without LOCALAPPDATA
