@@ -705,8 +705,15 @@ jobs:
       # steps: `diagnostics` changes what some code does (victory-core's log
       # cap, victory-shader's loop limit read from the environment), so the
       # tests must pass with it too, not only compile.
+      # Both runs get a fresh, empty TMPDIR (std::env::temp_dir() reads it), so
+      # a test that leaves scratch files behind fails here: the checkout check
+      # below never sees the temp dir, and on a contributor's machine the
+      # leftovers pile up in /tmp with every run. rustc and the linker clean
+      # up their own temp files there, so the directory must end up empty.
       - name: cargo test
         run: |
+          export TMPDIR="${RUNNER_TEMP}/cargo-test-tmp"
+          mkdir "${TMPDIR}"
           read -r -a crates <<< "${LINUX_CRATES}"
           skips=(
             --skip image::tests::parses_own_test_binary
@@ -719,6 +726,12 @@ jobs:
           )
           cargo test --locked --no-fail-fast "${crates[@]}" -- --exact "${skips[@]}"
           cargo test --locked --no-fail-fast --all-features "${crates[@]}" -- --exact "${skips[@]}"
+          leftovers="$(find "${TMPDIR}" -mindepth 1 -maxdepth 2)"
+          if [[ -n "${leftovers}" ]]; then
+            echo "::error::cargo test left files in TMPDIR" >&2
+            printf '%s\n' "${leftovers}" >&2
+            exit 1
+          fi
 
       # Builds, build scripts and tests must leave the checkout as they found
       # it: a test writing scratch files into the source tree (instead of a
