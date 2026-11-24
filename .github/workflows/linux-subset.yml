@@ -716,6 +716,13 @@ jobs:
       # relies on it would otherwise pass here and misbehave only in a real
       # build. Each adds one optimised build of the crates, well under the
       # job's timeout.
+      # The release run also uses --test-threads 1: the runner compiles with as
+      # many cores as cargo wants, but each test binary then runs one test at
+      # a time, so a test that races on a shared static, a temp file under
+      # TMPDIR, or an OS-global resource can still pass under the default
+      # parallel harness on a fast machine and fail under Wine or in a
+      # debugger, where timing differs. One ordered pass is enough; the other
+      # three runs keep the default threading so nothing only fails in release.
       # All four runs get a fresh, empty TMPDIR (std::env::temp_dir() reads it), so
       # a test that leaves scratch files behind fails here: the checkout check
       # below never sees the temp dir, and on a contributor's machine the
@@ -838,7 +845,7 @@ jobs:
           )
           "${offline[@]}" cargo test --locked --no-fail-fast "${crates[@]}" -- --exact "${skips[@]}"
           "${offline[@]}" cargo test --locked --no-fail-fast --all-features "${crates[@]}" -- --exact "${skips[@]}"
-          "${offline[@]}" cargo test --locked --no-fail-fast --release "${crates[@]}" -- --exact "${skips[@]}"
+          "${offline[@]}" cargo test --locked --no-fail-fast --release "${crates[@]}" -- --exact --test-threads 1 "${skips[@]}"
           "${offline[@]}" cargo test --locked --no-fail-fast --profile diag --all-features "${crates[@]}" -- --exact "${skips[@]}"
           read -r -a hermetic <<< "${IGNORED_HERMETIC}"
           read -r -a external <<< "${IGNORED_EXTERNAL}"
@@ -1102,3 +1109,30 @@ jobs:
           cargo +"${MSRV}" check --locked --workspace --all-targets --target x86_64-pc-windows-msvc
           cargo +"${MSRV}" check --locked --workspace --all-targets --all-features --target x86_64-pc-windows-msvc
           cargo +"${MSRV}" check --locked --all-targets --target x86_64-pc-windows-msvc --manifest-path tests/fixtures/hle-probe/Cargo.toml
+
+      # As in the linux and windows-target-check jobs: build scripts and the
+      # msrv checks must leave the checkout as they found it (output under
+      # CARGO_TARGET_DIR in RUNNER_TEMP, or target/, does not count).
+      - name: Checkout unchanged by the steps above
+        run: |
+          changes="$(git status --porcelain=v1 --untracked-files=all)"
+          if [[ -n "${changes}" ]]; then
+            echo "::error::the steps above modified or created files in the checkout" >&2
+            printf '%s\n' "${changes}" >&2
+            git diff --stat >&2
+            exit 1
+          fi
+          list="${RUNNER_TEMP}/ignored-files"
+          git ls-files -z --others --ignored --exclude-standard --directory > "${list}"
+          mapfile -d '' -t ignored < "${list}"
+          stray=()
+          for f in "${ignored[@]}"; do
+            if [[ "${f}" != target/ && ! "${f}" =~ ^tests/fixtures/[^/]+/target/$ ]]; then
+              stray+=("${f}")
+            fi
+          done
+          if [[ "${#stray[@]}" -ne 0 ]]; then
+            echo "::error::the steps above created ignored files outside target/" >&2
+            printf '%s\n' "${stray[@]}" >&2
+            exit 1
+          fi
