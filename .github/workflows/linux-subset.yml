@@ -320,17 +320,24 @@ jobs:
       # is an ELF on Linux. They still run on Windows. Once the workspace's
       # Linux gates land they are cfg(windows) and these --skip flags are no-ops.
       # --no-fail-fast: report failures from every test binary, not the first.
+      # The second run turns every feature on, like the clippy and rustdoc
+      # steps: `diagnostics` changes what some code does (victory-core's log
+      # cap, victory-shader's loop limit read from the environment), so the
+      # tests must pass with it too, not only compile.
       - name: cargo test
         run: |
           read -r -a crates <<< "${LINUX_CRATES}"
-          cargo test --locked --no-fail-fast "${crates[@]}" -- --exact \
-            --skip image::tests::parses_own_test_binary \
-            --skip image::tests::rva_to_file_offset_maps_entry_point \
-            --skip image::tests::rva_to_file_offset_rejects_offsets_past_4_gib \
-            --skip image::tests::rejects_iat_outside_image \
-            --skip prepare::tests::patches_own_test_binary \
-            --skip prepare::tests::keeps_iat_slots_when_import_size_excludes_the_terminator \
+          skips=(
+            --skip image::tests::parses_own_test_binary
+            --skip image::tests::rva_to_file_offset_maps_entry_point
+            --skip image::tests::rva_to_file_offset_rejects_offsets_past_4_gib
+            --skip image::tests::rejects_iat_outside_image
+            --skip prepare::tests::patches_own_test_binary
+            --skip prepare::tests::keeps_iat_slots_when_import_size_excludes_the_terminator
             --skip prepare::tests::file_name_is_stable_per_build
+          )
+          cargo test --locked --no-fail-fast "${crates[@]}" -- --exact "${skips[@]}"
+          cargo test --locked --no-fail-fast --all-features "${crates[@]}" -- --exact "${skips[@]}"
 
   # Type-checks the Windows build from Linux: no MSVC, no linking, nothing runs.
   # Catches compile errors in cfg(windows) code (most of victory-gpu,
