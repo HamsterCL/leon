@@ -96,6 +96,55 @@ jobs:
         with:
           persist-credentials: false
 
+      # Every step here, and the rust-cache key, trusts rust-toolchain.toml to
+      # name one exact release. A channel of `stable` (or `beta`, `nightly`,
+      # a bare `1.98`) still installs and passes, but floats to whatever is
+      # newest that day: new lints fail a PR that changed nothing, and main
+      # and a PR build with different compilers. A `path` toolchain is a
+      # local directory the runner does not have, and a legacy
+      # `rust-toolchain` file next to it would take precedence over the
+      # .toml in rustup. The pin must also be no older than the workspace's
+      # rust-version, or the msrv job checks with a compiler newer than the
+      # one every other step uses. Read with the runner's Python 3 tomllib
+      # (-I: no site packages, no cwd on sys.path) before rustup reads it.
+      - name: Toolchain pin is one exact release
+        run: |
+          python3 -I - <<'EOF'
+          import os, re, sys, tomllib
+
+          def load(path):
+              with open(path, "rb") as f:
+                  return tomllib.load(f)
+
+          failed = False
+          if os.path.lexists("rust-toolchain"):
+              print("::error file=rust-toolchain::legacy toolchain file overrides rust-toolchain.toml", file=sys.stderr)
+              failed = True
+          toolchain = load("rust-toolchain.toml").get("toolchain", {})
+          channel = toolchain.get("channel")
+          pin = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", channel) if isinstance(channel, str) else None
+          if pin is None:
+              print(f"::error file=rust-toolchain.toml::channel {channel!r} is not an exact release (MAJOR.MINOR.PATCH)", file=sys.stderr)
+              failed = True
+          if "path" in toolchain:
+              print("::error file=rust-toolchain.toml::toolchain names a local path", file=sys.stderr)
+              failed = True
+          msrv = load("Cargo.toml").get("workspace", {}).get("package", {}).get("rust-version", "")
+          floor = re.fullmatch(r"(\d+)\.(\d+)(?:\.(\d+))?", msrv) if isinstance(msrv, str) else None
+          if floor is None:
+              print(f"::error file=Cargo.toml::unexpected workspace rust-version {msrv!r}", file=sys.stderr)
+              failed = True
+          elif pin is not None:
+              have = tuple(int(g) for g in pin.groups())
+              need = tuple(int(g or 0) for g in floor.groups())
+              if have < need:
+                  print(f"::error file=rust-toolchain.toml::channel {channel} is older than the workspace rust-version {msrv}", file=sys.stderr)
+                  failed = True
+          if failed:
+              sys.exit(1)
+          print(f"Pinned toolchain {channel}, rust-version {msrv}")
+          EOF
+
       # rustup is preinstalled; this installs the toolchain pinned in
       # rust-toolchain.toml (with clippy and rustfmt). --no-self-update keeps
       # the runner image's rustup as is: otherwise rustup replaces itself
