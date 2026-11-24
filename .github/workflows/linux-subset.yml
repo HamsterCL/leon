@@ -730,6 +730,11 @@ jobs:
       # well. rustup and cargo keep their own homes: both are pinned to where
       # they were before HOME moves, so the toolchain and the registry cache
       # are the ones the steps above used.
+      # Both directories sit under one whose name has a space and a non-ASCII
+      # letter, as a contributor's may ("/home/zoë/My Files"). The runner's
+      # own paths are plain ASCII with no spaces, so a test that splits a
+      # temp path on whitespace, passes it unquoted through a shell, or
+      # assumes it is ASCII would otherwise pass here and fail for them.
       # All four also have no network: they run in a new network namespace
       # (unshare, as the runner user, so permission checks still apply) that
       # holds only a downed loopback, with CARGO_NET_OFFLINE set. A test or
@@ -780,10 +785,11 @@ jobs:
           export CARGO_NET_OFFLINE=true
           export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
           export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
-          export HOME="${RUNNER_TEMP}/cargo-test-home"
-          mkdir "${HOME}"
+          scratch="${RUNNER_TEMP}/cargo test ä"
+          export HOME="${scratch}/home"
+          mkdir -p "${HOME}"
           unset XDG_CACHE_HOME XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME
-          export TMPDIR="${RUNNER_TEMP}/cargo-test-tmp"
+          export TMPDIR="${scratch}/tmp"
           mkdir "${TMPDIR}"
           keep=()
           for name in PATH HOME TMPDIR CARGO_HOME RUSTUP_HOME CARGO_NET_OFFLINE \
