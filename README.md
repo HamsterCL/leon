@@ -111,6 +111,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 
 | Variable | Effect |
 |----------|--------|
+| `VICTORY_LOGS=1` or `0` | shows the log (in a console of its own when there is none) or turns it off and hides that console; unset, the log goes where it always did |
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
