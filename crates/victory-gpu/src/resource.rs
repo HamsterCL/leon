@@ -2049,6 +2049,37 @@ mod tests {
         };
         copy(list, &crop_loc, 0, 0, 0, &tex_loc, &crop_box);
 
+        // Both a source box and a whole subresource can fill only part of a footprint.
+        let larger = PlacedFootprint {
+            width: 6,
+            height: 6,
+            row_pitch: 24,
+            ..full_rows
+        };
+        let partials = [(full_rows, 0, 0, Some(crop_box)), (larger, 1, 1, None)].map(
+            |(footprint, x, y, region)| {
+                let size = u64::from(footprint.row_pitch) * u64::from(footprint.height);
+                let mut output = null;
+                assert_eq!(
+                    create_committed(
+                        null, &PROPERTIES, 0, &buffer(size), 0, null.cast(), iid, &mut output,
+                    ),
+                    S_OK
+                );
+                let (data, len) = buffer_bytes(output).unwrap();
+                // SAFETY: fill this mapped destination before the GPU copy.
+                unsafe { data.write_bytes(0xa5, len as usize) };
+                let dst = Location {
+                    resource: output,
+                    kind: 1,
+                    footprint,
+                };
+                let src_box = region.as_ref().map_or(std::ptr::null(), std::ptr::from_ref);
+                copy(list, &dst, x, y, 0, &tex_loc, src_box);
+                (output, footprint, x, y, region)
+            },
+        );
+
         // 5) Console formats 118..=120 (3 B/texel) map to 4-byte PC formats
         // (45..=47): skipped cleanly without breaking Close() or touching dst.
         let mut dst_d16s8 = null;
@@ -2069,6 +2100,43 @@ mod tests {
             },
         };
         copy(list, &d16s8_loc, 0, 0, 0, &tex_loc, std::ptr::null());
+
+        let committed = |desc: &ResourceDesc| {
+            let mut resource = null;
+            assert_eq!(
+                create_committed(null, &PROPERTIES, 0, desc, 0, null.cast(), iid, &mut resource),
+                S_OK
+            );
+            resource
+        };
+        let read_back = |source| {
+            let output = committed(&buffer(1024));
+            let from = Location { resource: source, kind: 0, footprint: full_rows };
+            let to = Location { resource: output, kind: 1, footprint: full_rows };
+            copy(list, &to, 0, 0, 0, &from, std::ptr::null());
+            output
+        };
+        let cpu_desc = ResourceDesc { layout: 1, ..tex_desc };
+        let cpu_source = committed(&cpu_desc);
+        let (cpu_data, _) = texture_memory(cpu_source).unwrap();
+        let cpu_size = texture_layout(&cpu_desc).unwrap().size;
+        // SAFETY: the committed linear texture owns its complete layout.
+        unsafe { cpu_data.cast_mut().write_bytes(0x5a, cpu_size as usize) };
+        let cpu_result = read_back(cpu_source);
+
+        let target_desc = ResourceDesc {
+            flags: 1, // ALLOW_RENDER_TARGET
+            ..cpu_desc
+        };
+        let target = committed(&target_desc);
+        let mut descriptor = [0u64; 16];
+        let handle = descriptor.as_mut_ptr() as u64;
+        crate::descriptor::create_rtv(null, target, null.cast(), handle);
+        let clear_color = [1.0, 0.0, 1.0, 1.0];
+        type ClearRtv =
+            extern "system" fn(This, u64, *const [f32; 4], u32, *const crate::list::Rect);
+        slot::<ClearRtv>(list, 0x1a0)(list, handle, &clear_color, 0, std::ptr::null());
+        let target_result = read_back(target);
 
         assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
         slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
@@ -2108,6 +2176,52 @@ mod tests {
         // SAFETY: dst_d16s8 holds 1024 bytes.
         let d16 = unsafe { std::slice::from_raw_parts(d16_ptr, 1024) };
         assert!(d16.iter().all(|&b| b == 0), "mismatched format 118 buffer touched");
+
+        for (output, footprint, dst_x, dst_y, region) in partials {
+            let [left, top, _, right, bottom, _] = region.unwrap_or([0, 0, 0, 4, 4, 1]);
+            let (data, len) = buffer_bytes(output).unwrap();
+            // SAFETY: the destination is still mapped after the submission.
+            let pixels = unsafe { std::slice::from_raw_parts(data, len as usize) };
+            for y in 0..footprint.height {
+                for x in 0..footprint.width {
+                    let at = (y * footprint.row_pitch + x * 4) as usize;
+                    let expected: &[u8] = if (dst_x..dst_x + (right - left)).contains(&x)
+                        && (dst_y..dst_y + (bottom - top)).contains(&y)
+                    {
+                        let src_at = ((top + y - dst_y) * 256 + (left + x - dst_x) * 4) as usize;
+                        &up[src_at..src_at + 4]
+                    } else {
+                        &[0xa5; 4]
+                    };
+                    assert_eq!(
+                        &pixels[at..at + 4], expected,
+                        "pixel ({x}, {y}) in {footprint:?}"
+                    );
+                }
+            }
+        }
+
+        for (output, expected, label) in [
+            (cpu_result, [0x5a; 4], "CPU-written linear texture"),
+            (target_result, [255, 0, 255, 255], "GPU-cleared linear render target"),
+        ] {
+            let (data, len) = buffer_bytes(output).unwrap();
+            // SAFETY: the queue submission completed and this buffer is live.
+            let pixels = unsafe { std::slice::from_raw_parts(data, len as usize) };
+            for y in 0..4 {
+                for x in 0..4 {
+                    let at = y * 256 + x * 4;
+                    assert_eq!(
+                        &pixels[at..at + 4],
+                        expected.as_slice(),
+                        "{label} pixel ({x}, {y})"
+                    );
+                }
+            }
+        }
+        for resource in [cpu_source, cpu_result, target, target_result] {
+            assert_eq!(slot::<Release>(resource, 0x10)(resource), 0);
+        }
     }
 
     #[test]
