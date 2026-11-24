@@ -491,6 +491,9 @@ fn check(
     }
     #[cfg(windows)]
     let Some(v) = checks.validator.as_mut() else {
+        if t.list && checks.host.is_none() {
+            t.lines.push(format!("{}  emitted", label()));
+        }
         return;
     };
     #[cfg(windows)]
