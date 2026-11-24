@@ -250,6 +250,50 @@ jobs:
             exit 1
           fi
 
+      # Git records two file modes that a Linux checkout honours and a Windows
+      # one does not. A symlink (mode 120000) is checked out on Windows, where
+      # core.symlinks is off by default, as a plain text file holding the
+      # target path, so the two platforms build different trees; nothing here
+      # needs one, so fail on any. An executable bit (100755) on a file that
+      # is not a script is usually an accident from a Linux, WSL or mounted-
+      # NTFS editor and shows as mode noise in every diff; fail on executable
+      # files that do not start with `#!`. Read from the index (`git ls-files
+      # -s`), not the checkout, so the runner's umask cannot hide either.
+      - name: Portable file modes
+        run: |
+          list="${RUNNER_TEMP}/modes"
+          git ls-files -z -s > "${list}"
+          links=()
+          stray_exec=()
+          while IFS= read -r -d '' entry; do
+            mode="${entry%% *}"
+            path="${entry#*$'\t'}"
+            case "${mode}" in
+              120000) links+=("${path}") ;;
+              100755)
+                magic="$(head -c 2 -- "${path}")"
+                if [[ "${magic}" != '#!' ]]; then
+                  stray_exec+=("${path}")
+                fi
+                ;;
+              *) ;;
+            esac
+          done < "${list}"
+          failed=0
+          if [[ "${#links[@]}" -ne 0 ]]; then
+            echo "::error::tracked symlinks (Windows checkouts get a text file instead)" >&2
+            printf '%s\n' "${links[@]}" >&2
+            failed=1
+          fi
+          if [[ "${#stray_exec[@]}" -ne 0 ]]; then
+            echo "::error::executable files without a #! line (git update-index --chmod=-x)" >&2
+            printf '%s\n' "${stray_exec[@]}" >&2
+            failed=1
+          fi
+          if [[ "${failed}" -ne 0 ]]; then
+            exit 1
+          fi
+
       # Lints all workflows: expression and context typos, unknown keys, and
       # (via ShellCheck) the `run:` scripts, which YAML parsing alone never
       # checks. actionlint silently skips the shell checks when shellcheck is
