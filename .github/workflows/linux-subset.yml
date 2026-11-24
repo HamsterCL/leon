@@ -756,6 +756,15 @@ jobs:
       # the same environment here as under `env -i` locally. A kept variable
       # that is unset becomes empty rather than going missing, which would
       # change what Cargo and rustup do, so only set ones are passed on.
+      # All four also run under umask 077, not the runner's 022, so every
+      # file and directory a test or build script makes is private to its
+      # owner, as on a contributor's machine set up that way (a hardened
+      # distro default, or a shared box). A test that has another process
+      # read back what it wrote as a different mode, compares the mode of a
+      # file it made against 0644 or 0755, or copies a file's permissions
+      # and expects group or world bits would otherwise pass here and fail
+      # there. The umask is inherited through unshare and env -i, and
+      # checked inside them, so the tests see exactly it.
       # #[ignore] tests never run in the four runs above, nor anywhere else
       # unless someone asks for them by name, so they rot unseen: a benchmark
       # that unwraps an API it no longer matches still compiles and still
@@ -782,6 +791,7 @@ jobs:
           if [[ -e "${userns}" && "$(< "${userns}")" != 0 ]]; then
             sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
+          umask 077
           export CARGO_NET_OFFLINE=true
           export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
           export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
@@ -802,6 +812,11 @@ jobs:
           inner_uid="$("${offline[@]}" id -u)"
           if [[ "${inner_uid}" != "${UID}" ]]; then
             echo "::error::unshare did not keep the runner's user id" >&2
+            exit 1
+          fi
+          inner_umask="$("${offline[@]}" sh -c umask)"
+          if [[ "${inner_umask}" != 0077 ]]; then
+            echo "::error::the tests would run under umask ${inner_umask}, not 0077" >&2
             exit 1
           fi
           # Fail if anything beyond the kept variables reaches the tests.
