@@ -88,8 +88,6 @@ mod diff_tests;
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
-#[cfg(all(test, windows))]
-mod image_atomic_tests;
 mod lower;
 mod own_bits;
 mod rect;
@@ -105,8 +103,6 @@ mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
 mod wave;
-#[cfg(all(test, windows))]
-mod wave_prefix_tests;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
@@ -666,39 +662,6 @@ fn emit_program(
     Ok((shader, wave_size))
 }
 
-/// The console gives a thread group up to 64 KiB of LDS; D3D12 gives its
-/// group shared memory 32 KiB in a compute shader and 28 KiB in a mesh
-/// shader. A program asking for more is refused here, by name, rather than
-/// by the validator or the pipeline later. A compute program declares its
-/// LDS only when it reads or writes it (a swizzle or permute does not), so
-/// one that never does is left alone; a mesh program always declares it.
-fn lds_fits(native: &NativeProgram, p: &ir::Program) -> Result<(), ShaderError> {
-    let (bytes, limit, what) = match &native.io {
-        crate::native::StageIo::Cs(cs) => {
-            let uses_lds = p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
-                matches!(i.fields, crate::gfx10::Fields::Ds { .. })
-                    && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
-            });
-            if !uses_lds {
-                return Ok(());
-            }
-            (
-                cs.lds_bytes(),
-                32 << 10,
-                "compute LDS over the host's 32 KiB",
-            )
-        }
-        crate::native::StageIo::Ms(ms) => {
-            (ms.lds_bytes, 28 << 10, "mesh LDS over the host's 28 KiB")
-        }
-        _ => return Ok(()),
-    };
-    if bytes > limit {
-        return Err(ShaderError::Unsupported { offset: 0, what });
-    }
-    Ok(())
-}
-
 /// The rows of an `ISG1`/`OSG1` part.
 fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
     use crate::dxbc::u32_at;
@@ -883,98 +846,6 @@ mod tests {
         let sfi0 = host.part(FourCC::SFI0).unwrap().data;
         let features = u64::from_le_bytes(sfi0.try_into().unwrap());
         assert_ne!(features & 0x200, 0, "SFI0 {features:#x}: no StencilRef");
-    }
-
-    #[test]
-    fn immediate_sampler_slots_distinguish_comparison_uses() {
-        let words = [
-            0xBE81_0380u32, // s_mov_b32 s1, 0
-            0xF40C_0000,
-            0xFA00_0000, // s_load_dwordx8 s[0:7], s[0:1], null
-            0xBE88_0380, // s_mov_b32 s8, 0
-            0xBE89_0380, // s_mov_b32 s9, 0
-            0xBE8A_0380, // s_mov_b32 s10, 0
-            0xBE8B_0380, // s_mov_b32 s11, 0
-            0x7E00_02F0, // v_mov_b32 v0, 0.5 (comparison reference)
-            0x7E02_02F0, // v_mov_b32 v1, 0.5 (u)
-            0x7E04_02F0, // v_mov_b32 v2, 0.5 (v)
-            0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
-            0xF080_0108,
-            0x0040_0301, // image_sample v3, v[1:2], s[0:7], s[8:11]
-            0xF0A0_0108,
-            0x0040_0400, // image_sample_c v4, v[0:2], s[0:7], s[8:11]
-            0xF0BC_0108,
-            0x0040_0500, // image_sample_c_lz v5, v[0:2], s[0:7], s[8:11]
-            0xF080_0108,
-            0x0040_0601, // image_sample v6, v[1:2], s[0:7], s[8:11]
-            0xBF8C_3F70, // s_waitcnt vmcnt(0)
-            0xF800_180F,
-            0x0605_0403, // exp mrt0, v3, v4, v5, v6 done vm
-            0xBF81_0000,
-        ];
-        let native = NativeProgram {
-            stage: HwStage::Ps,
-            wave64: false,
-            vgprs: 7,
-            layout: vec![crate::native::RootParam {
-                root: RootType::Table,
-                table_offset_dwords: 0,
-                sgprs: 1,
-                base_register: 0,
-                user_data: 0,
-                slot: 0,
-            }],
-            used: vec![crate::native::UsedResource {
-                kind: crate::native::ResourceType::Srv,
-                root: RootType::Table,
-                table_offset_dwords: 0,
-                lower_bound: 0,
-                stride: 0,
-                dwords: 8,
-                user_data: 0,
-                slot: 0,
-            }],
-            io: StageIo::Ps {
-                inputs: vec![],
-                input_addr: 0,
-                db_shader_control: 0,
-                patches: vec![],
-            },
-            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-        };
-        let output = SigElement {
-            name: "SV_Target".into(),
-            index: 0,
-            kind: 16,
-            comp: 9,
-            interp: 0,
-            row: Some(0),
-            col: 0,
-            cols: 4,
-            usage: 15,
-            half: false,
-        };
-        let osg1 = container::signature(&[output], false);
-        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
-        let c = Container::parse(&bytes).unwrap();
-        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-        let st = structure::structure(&p).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
-        let io = io::raise(&p, &native).unwrap();
-        let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
-
-        let sampler = StaticSampler::from_words([0; 4]);
-        let comparison = StaticSampler {
-            filter: sampler.filter | 0x80,
-            ..sampler
-        };
-        assert_eq!(out.samplers, [[0; 4]; 2]);
-        assert_eq!(out.static_samplers, [sampler, comparison]);
-        #[cfg(windows)]
-        if let Some(path) = super::validator::Validator::default_path() {
-            let mut v = super::validator::Validator::load(Some(&path)).unwrap();
-            v.validate(&mut out.dxil.clone()).unwrap();
-        }
     }
 
     /// A wave64 compute program that writes only EXEC's high dword
@@ -1185,19 +1056,6 @@ mod tests {
             v.validate(&mut vs.dxil.clone()).unwrap();
         }
         host.pipeline(&vs, &ps).unwrap();
-        // vkd3d-proton does not enforce the DXIL container checksum. The
-        // successful pipeline above is still exercised under Wine.
-        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
-        // SAFETY: both names are NUL terminated, and the module is checked
-        // before looking up its export. The export is never called.
-        let under_wine = unsafe {
-            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
-            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
-        };
-        if under_wine {
-            eprintln!("pipeline created under Wine. Skipping native D3D12 checksum checks.");
-            return;
-        }
         // The runtime checks the container hash: no hash or a wrong one is
         // refused. (Recent runtimes also take sixteen 0x01 bytes, a bypass
         // value; ours works with older ones too.)
@@ -1302,42 +1160,6 @@ mod tests {
         assert_eq!(center[4 + 1], 0, "center interpolation is per pixel");
         let sample = psv_of(1 << 0);
         assert_eq!(sample[4 + 1], 1, "PSInfo.SampleFrequency");
-    }
-
-    /// A system value whose console signature used non-canonical casing (such
-    /// as `SV_TARGET`) must be written with DXIL's canonical name (`SV_Target`)
-    /// in `ISG1`/`OSG1` so `dxil.dll` validation accepts the container part.
-    #[test]
-    #[cfg(windows)]
-    fn non_canonical_system_value_name_validates() {
-        let mut s = super::shader::Shader::new(true);
-        s.outputs.push(SigElement {
-            name: "SV_TARGET".into(),
-            index: 0,
-            kind: 16,
-            comp: 9,
-            interp: 0,
-            row: Some(0),
-            col: 0,
-            cols: 4,
-            usage: 0xf,
-            half: false,
-        });
-        let zero = s.m.f32(0);
-        let id = s.m.i32(0);
-        let row = s.m.i32(0);
-        let void = s.t.void;
-        for ch in 0..4u8 {
-            let c = s.m.i8(ch);
-            s.op(s.entry, "storeOutput.f32", super::bitcode::Attr::NoUnwind, void, 5, &[id, row, c, zero]);
-        }
-        s.m.terminate(s.entry, super::bitcode::Term::Ret);
-        let mut c = s.finish();
-        let path = super::validator::Validator::default_path();
-        let Ok(mut v) = super::validator::Validator::load(path.as_deref()) else {
-            return;
-        };
-        v.validate(&mut c).unwrap();
     }
 
     /// A pixel shader reading channel z of an input whose element starts at

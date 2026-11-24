@@ -2,7 +2,7 @@
 //! (or `s_nand_saveexec 0`) and the restore of the saved mask runs in every lane of the console's
 //! wave, the inactive ones included, which is how the compiler expands
 //! HLSL wave reductions and prefix sums (an identity put into the inactive
-//! lanes with `v_cndmask`, then DPP, `v_permlane16`, `v_permlanex16` and `v_readlane`
+//! lanes with `v_cndmask`, then DPP, `v_permlanex16` and `v_readlane`
 //! steps). A host lane that is elsewhere cannot run that code, so each
 //! section is simulated on the console's lanes with symbolic values, and a
 //! value it leaves is lowered by what it turned out to be: the reduction or
@@ -435,29 +435,22 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     })
                     .collect()
             }
-            (n @ ("v_permlane16_b32" | "v_permlanex16_b32"), Some(a)) => {
-                // Lane i of a row picks nibble i of {src2, src1}: from its
-                // own row (permlane16) or from the other row of its half of
-                // 32 lanes (permlanex16). Only with every lane active: the
-                // opsel bits (fi, bound_ctrl) decide what an inactive lane
-                // reads.
+            ("v_permlanex16_b32", Some(a)) => {
+                // Lanes of each row read the other row of their half; lane
+                // i's pick is nibble i of {src2, src1}.
                 let sel = |k: usize| match v.src.get(k) {
                     Some(&Operand::Const(c)) => crate::resource::inline(c),
                     Some(&Operand::Literal(x)) => Some(x),
                     _ => None,
                 };
                 match (sel(1), sel(2)) {
-                    (Some(s1), Some(s2)) if exec == all => {
+                    (Some(s1), Some(s2)) => {
                         let s = u64::from(s1) | u64::from(s2) << 32;
                         (0..wave)
                             .map(|l| {
-                                let row = if n == "v_permlane16_b32" {
-                                    l & !15
-                                } else {
-                                    (l & !31) | ((l & 16) ^ 16)
-                                };
+                                let other = (l & !31) | ((l & 16) ^ 16);
                                 let pick = (s >> (4 * (l & 15)) & 15) as u32;
-                                a[(row | pick) as usize]
+                                a[(other | pick) as usize]
                             })
                             .collect()
                     }

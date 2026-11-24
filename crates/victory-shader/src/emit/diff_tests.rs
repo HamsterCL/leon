@@ -3,9 +3,8 @@
 //! dispatched) on the host GPU with the same inputs.
 //!
 //! Needs `VICTORY_CONSOLE_DXC` (the console SDK's `dxc.exe`) and a PC
-//! `dxc.exe` (`VICTORY_PC_DXC`, then the newest Windows SDK's, then the
-//! sibling of `VICTORY_DXIL` for standalone DXC). Skipped without both
-//! compilers. Set `VICTORY_WARP=1` to draw on WARP.
+//! `dxc.exe` (`VICTORY_PC_DXC`, else the newest Windows SDK's); skipped
+//! without them. Set `VICTORY_WARP=1` to draw on WARP.
 
 use std::path::{Path, PathBuf};
 
@@ -653,48 +652,12 @@ const MS_CASES: &[(&str, u32, &str)] = &[
 ];
 
 fn tools() -> Option<(PathBuf, PathBuf)> {
-    tools_in(Path::new(super::validator::SDK_BIN), |key| {
-        std::env::var_os(key).map(PathBuf::from)
-    })
-}
-
-fn tools_in(kits: &Path, env_path: impl Fn(&str) -> Option<PathBuf>) -> Option<(PathBuf, PathBuf)> {
-    let console = env_path("VICTORY_CONSOLE_DXC")?;
-    let pc = env_path("VICTORY_PC_DXC")
-        .or_else(|| super::validator::sdk_tool(kits, "dxc.exe"))
-        .or_else(|| env_path("VICTORY_DXIL").map(|dll| dll.with_file_name("dxc.exe")))?;
-    (console.exists() && pc.exists()).then_some((console, pc))
-}
-
-#[test]
-fn pc_compiler_prefers_sdk_and_supports_standalone_dxc() {
-    let dir = tempfile::tempdir().unwrap();
-    let kits = dir.path().join("bin");
-    let sdk = kits.join("10.0.26100.0").join("x64");
-    std::fs::create_dir_all(&sdk).unwrap();
-    let console = dir.path().join("console.exe");
-    let validator = dir.path().join("dxil.dll");
-    let explicit_pc = dir.path().join("dxc.exe");
-    let sdk_pc = sdk.join("dxc.exe");
-    for path in [&console, &validator, &explicit_pc, &sdk_pc] {
-        std::fs::write(path, []).unwrap();
-    }
-    let locate = |pc: Option<&PathBuf>| {
-        tools_in(&kits, |key| match key {
-            "VICTORY_CONSOLE_DXC" => Some(console.clone()),
-            "VICTORY_DXIL" => Some(validator.clone()),
-            "VICTORY_PC_DXC" => pc.cloned(),
-            _ => None,
-        })
+    let console = PathBuf::from(std::env::var_os("VICTORY_CONSOLE_DXC")?);
+    let pc = match std::env::var_os("VICTORY_PC_DXC") {
+        Some(p) => PathBuf::from(p),
+        None => super::validator::Validator::default_path()?.with_file_name("dxc.exe"),
     };
-    assert_eq!(locate(None), Some((console.clone(), sdk_pc.clone())));
-    assert_eq!(locate(Some(&dir.path().join("missing.exe"))), None);
-    assert_eq!(
-        locate(Some(&explicit_pc)),
-        Some((console.clone(), explicit_pc.clone()))
-    );
-    std::fs::remove_file(sdk_pc).unwrap();
-    assert_eq!(locate(None), Some((console, explicit_pc)));
+    (console.exists() && pc.exists()).then_some((console, pc))
 }
 
 fn compile(dxc: &Path, dir: &Path, src: &str, entry: &str, profile: &str) -> Vec<u8> {
@@ -857,7 +820,9 @@ fn translated_shaders_draw_as_pc_ones() {
             compile(&pc, &dir, src, vs, "vs_6_5"),
             compile(&pc, &dir, src, "ps", "ps_6_5"),
         );
-        let root_p = host.root_signature_bytes(&ps_p).unwrap();
+        // SAFETY: the PC container carries its root signature.
+        let root_p: ID3D12RootSignature =
+            unsafe { host.device.CreateRootSignature(0, &ps_p) }.unwrap();
         let pso_p = host.pipeline_with(&root_p, &vs_p, &ps_p).unwrap();
         let theirs = host
             .draw(
@@ -969,7 +934,9 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
             compile(&pc, &dir, src, "ms", "ms_6_5"),
             compile(&pc, &dir, src, "mps", "ps_6_5"),
         );
-        let root_p = host.root_signature_bytes(&ms_p).unwrap();
+        // SAFETY: the PC container carries its root signature.
+        let root_p: ID3D12RootSignature =
+            unsafe { host.device.CreateRootSignature(0, &ms_p) }.unwrap();
         let pso_p = host.mesh_pipeline_with(&root_p, &ms_p, &ps_p).unwrap();
         let theirs = host
             .draw(
@@ -1268,7 +1235,9 @@ fn translated_compute_matches_pc() {
         }
         let ours = ours.unwrap();
         let cs_p = compile(&pc, &dir, src, "cs", "cs_6_5");
-        let root_p = host.root_signature_bytes(&cs_p).unwrap();
+        // SAFETY: the PC container carries its root signature.
+        let root_p: ID3D12RootSignature =
+            unsafe { host.device.CreateRootSignature(0, &cs_p) }.unwrap();
         let pso_p = host.compute_pipeline_with(&root_p, &cs_p).unwrap();
         let table = |sampler, index| Root::Table { sampler, index };
         let theirs = host

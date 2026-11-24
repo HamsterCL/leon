@@ -1,8 +1,7 @@
 //! One-to-one SSA form of a native program (decision 0003, step 1).
 //!
 //! Every machine instruction becomes one [`Inst`], except scheduling-only
-//! ones (`s_nop`, `s_waitcnt*`, `s_inst_prefetch`...) and redundant conditional
-//! branches.
+//! ones (`s_nop`, `s_waitcnt*`, `s_inst_prefetch`...), which are dropped.
 //! Each register dword is a variable: a read names the [`Value`] it sees, a
 //! write defines a new one, and [`Phi`]s merge values where control flow
 //! joins. Nothing is raised: an instruction keeps its opcode and decoded
@@ -45,8 +44,8 @@ pub struct Program {
     pub wave64: bool,
     /// VGPRs v0 up to this exist; bounds M0-relative access.
     pub vgprs: u16,
-    /// In code order, then copies made to give every loop one entry. Block 0
-    /// is the entry, which can be an empty block before the code.
+    /// In code order, then copies made to give every loop one entry; block 0
+    /// is the entry.
     pub blocks: Vec<Block>,
     /// Registers read before any write, with their value on entry: what the
     /// hardware or a called fetch routine set up (user SGPRs, system values,
@@ -57,7 +56,7 @@ pub struct Program {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
     /// Byte offset of the block's first machine instruction (shared by a
-    /// block and its copies). Zero for an empty entry block.
+    /// block and its copies).
     pub offset: usize,
     pub preds: Vec<usize>,
     pub phis: Vec<Phi>,
@@ -81,21 +80,6 @@ pub enum Exit {
 }
 
 impl Exit {
-    fn successor_at(&self, index: usize) -> Option<usize> {
-        match (*self, index) {
-            (Exit::Jump(b), 0)
-            | (Exit::Branch { taken: b, .. }, 0) => Some(b),
-            (Exit::Branch { not_taken, .. }, 1) => Some(not_taken),
-            _ => None,
-        }
-    }
-
-    fn successor_iter(&self) -> impl Iterator<Item = usize> {
-        self.successor_at(0)
-            .into_iter()
-            .chain(self.successor_at(1))
-    }
-
     pub fn successors(&self) -> Vec<usize> {
         match *self {
             Exit::Jump(b) => vec![b],
@@ -169,7 +153,6 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
     let block_at = |offset: usize| {
         leaders
             .binary_search(&offset)
-            .map(|b| b + preheader)
             .map_err(|_| isa(offset, "jump into a block"))
     };
 
@@ -183,18 +166,6 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
             exit: Exit::End,
         })
         .collect();
-    if preheader != 0 {
-        blocks.insert(
-            0,
-            Block {
-                offset: 0,
-                preds: Vec::new(),
-                phis: Vec::new(),
-                insts: Vec::new(),
-                exit: Exit::Jump(1),
-            },
-        );
-    }
     let next_offsets: Vec<Option<usize>> = (0..list.len())
         .map(|i| list.get(i + 1).map(|n| n.offset))
         .collect();
@@ -214,30 +185,15 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
             (*to, *from) = (parked[k].1, parked[k].2);
         }
         let fallthrough = || block_at(next.ok_or(isa(machine.offset, "falls off the code"))?);
-        // A conditional SOPP branch to fallthrough has no register effects
-        // and contributes one edge to the join. Calls also use Flow::Branch
-        // but write a return address.
-        if machine.encoding == gfx10::Encoding::Sopp
-            && matches!(flow, Flow::Branch(target) if Some(target) == next)
-        {
-            blocks[b].exit = Exit::Jump(fallthrough()?);
-            continue;
-        }
         let ends = flow != Flow::Next || next.is_none_or(|n| leaders.binary_search(&n).is_ok());
         if ends {
             blocks[b].exit = match flow {
                 Flow::Next => Exit::Jump(fallthrough()?),
                 Flow::Jump(t) => Exit::Jump(block_at(t)?),
-                Flow::Branch(t) => {
-                    let taken = block_at(t)?;
-                    let not_taken = fallthrough()?;
-                    // The same successor needs only one incoming SSA edge.
-                    if taken == not_taken {
-                        Exit::Jump(taken)
-                    } else {
-                        Exit::Branch { taken, not_taken }
-                    }
-                }
+                Flow::Branch(t) => Exit::Branch {
+                    taken: block_at(t)?,
+                    not_taken: fallthrough()?,
+                },
                 Flow::Stop if name == "s_setpc_b64" => Exit::Indirect,
                 Flow::Stop => Exit::End,
             };
@@ -259,6 +215,12 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
         }
     }
     link(&mut blocks);
+    if !blocks[0].preds.is_empty() {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "a branch to the program entry",
+        });
+    }
     split_irreducible(&mut blocks)?;
 
     Ok(rename(blocks, wave64, vgprs))
@@ -863,8 +825,8 @@ pub(crate) fn reverse_postorder(blocks: &[Block]) -> Vec<usize> {
     while let Some(top) = stack.last_mut() {
         let (b, i) = *top;
         top.1 += 1;
-        match blocks[b].exit.successor_at(i) {
-            Some(s) if !seen[s] => {
+        match blocks[b].exit.successors().get(i) {
+            Some(&s) if !seen[s] => {
                 seen[s] = true;
                 stack.push((s, 0));
             }
@@ -885,7 +847,7 @@ fn link(blocks: &mut [Block]) {
         block.preds.clear();
     }
     for b in 0..blocks.len() {
-        for s in blocks[b].exit.successor_iter() {
+        for s in blocks[b].exit.successors() {
             blocks[s].preds.push(b);
         }
     }
@@ -902,7 +864,7 @@ pub(crate) fn irreducible_edge(
     let &entry = order.first()?;
     let idom = idoms(blocks, order, index);
     for &b in order {
-        for s in blocks[b].exit.successor_iter() {
+        for s in blocks[b].exit.successors() {
             if index[s] > index[b] {
                 continue;
             }
@@ -996,7 +958,7 @@ fn split_irreducible(blocks: &mut Vec<Block>) -> Result<(), ShaderError> {
             }
             copy[b] = blocks.len() + copied.len();
             copied.push(b);
-            for s in blocks[b].exit.successor_iter() {
+            for s in blocks[b].exit.successors() {
                 if region[s] && s != header {
                     stack.push(s);
                 }
@@ -1040,16 +1002,16 @@ fn multi_entry_loop(blocks: &[Block], inside: &[bool]) -> Option<(Vec<bool>, Vec
         let mut seen = vec![false; blocks.len()];
         let mut stack = vec![from];
         while let Some(b) = stack.pop() {
-            let mut visit = |n: usize| {
+            let next = if forward {
+                blocks[b].exit.successors()
+            } else {
+                blocks[b].preds.clone()
+            };
+            for n in next {
                 if inside[n] && !seen[n] {
                     seen[n] = true;
                     stack.push(n);
                 }
-            };
-            if forward {
-                blocks[b].exit.successor_iter().for_each(&mut visit);
-            } else {
-                blocks[b].preds.iter().copied().for_each(&mut visit);
             }
         }
         seen
@@ -1111,7 +1073,7 @@ fn liveness(blocks: &[Block], order: &[usize]) -> (Vec<RegSet>, Vec<RegSet>) {
         changed = false;
         for &b in order.iter().rev() {
             let mut out = empty;
-            for s in blocks[b].exit.successor_iter() {
+            for s in blocks[b].exit.successors() {
                 for (o, i) in out.iter_mut().zip(&live_in[s]) {
                     *o |= i;
                 }
@@ -1132,28 +1094,13 @@ fn liveness(blocks: &[Block], order: &[usize]) -> (Vec<RegSet>, Vec<RegSet>) {
 /// Phis are placed for every live register at every join; those whose
 /// arguments are all one value (or the phi itself) are replaced by it.
 fn remove_trivial_phis(blocks: &mut [Block], values: u32) {
-    remove_trivial_phis_steps(blocks, values);
-}
-
-fn remove_trivial_phis_steps(blocks: &mut [Block], values: u32) -> usize {
-    fn find(replaced: &mut [Value], v: Value, steps: &mut usize) -> Value {
-        let mut root = v;
-        while replaced[root.0 as usize] != root {
-            *steps += 1;
-            root = replaced[root.0 as usize];
-        }
-        let mut cur = v;
-        while replaced[cur.0 as usize] != root {
-            *steps += 1;
-            let next = replaced[cur.0 as usize];
-            replaced[cur.0 as usize] = root;
-            cur = next;
-        }
-        root
-    }
-
     let mut replaced: Vec<Value> = (0..values).map(Value).collect();
-    let mut steps = 0usize;
+    let find = |replaced: &[Value], mut v: Value| {
+        while replaced[v.0 as usize] != v {
+            v = replaced[v.0 as usize];
+        }
+        v
+    };
     let mut changed = true;
     while changed {
         changed = false;
@@ -1161,7 +1108,7 @@ fn remove_trivial_phis_steps(blocks: &mut [Block], values: u32) -> usize {
             block.phis.retain(|phi| {
                 let mut only = None;
                 for &a in &phi.args {
-                    let a = find(&mut replaced, a, &mut steps);
+                    let a = find(&replaced, a);
                     if a == phi.value || Some(a) == only {
                         continue;
                     }
@@ -1180,16 +1127,15 @@ fn remove_trivial_phis_steps(blocks: &mut [Block], values: u32) -> usize {
     for block in blocks {
         for phi in &mut block.phis {
             for a in &mut phi.args {
-                *a = find(&mut replaced, *a, &mut steps);
+                *a = find(&replaced, *a);
             }
         }
         for inst in &mut block.insts {
             for (_, v) in &mut inst.reads {
-                *v = find(&mut replaced, *v, &mut steps);
+                *v = find(&replaced, *v);
             }
         }
     }
-    steps
 }
 
 /// Scheduling hints, performance counters and tracing: no effect on results.
@@ -1258,58 +1204,23 @@ fn effects(
     );
     match fields {
         Fields::Sop { dst, src, .. } => {
-            let (src_indexed, dst_indexed) = match name {
-                "s_movrels_b32" => (true, false),
-                "s_movreld_b32" => (false, true),
-                _ => (false, false),
-            };
-            if (!src_indexed && !dst_indexed && name.starts_with("s_movrel"))
+            if name.starts_with("s_movrel")
                 || name.starts_with("s_subvector_loop")
                 || matches!(name, "s_call_b64" | "s_rfe_b64")
             {
                 return Err(unsupported());
             }
-            const SGPRS: u8 = 106;
-            let indexed_sgpr = |op: &Operand, out: &mut Vec<Reg>| match *op {
-                Operand::Scalar { code, .. } if code < SGPRS => {
-                    out.extend((code..SGPRS).map(Reg::S));
-                    Ok(())
-                }
-                _ => Err(ShaderError::Isa {
-                    offset: inst.offset,
-                    reason: "relative SGPR base outside the SGPR range",
-                }),
-            };
-            if src_indexed {
-                let s = src.first().ok_or_else(unsupported)?;
-                indexed_sgpr(s, &mut r)?;
-                for s in &src[1..] {
-                    regs(s, &mut r)?;
-                }
-                if !r.contains(&Reg::S(M0)) {
-                    r.push(Reg::S(M0));
-                }
-            } else {
-                for s in src {
-                    regs(s, &mut r)?;
-                }
+            for s in src {
+                regs(s, &mut r)?;
             }
             if let Some(d) = dst {
-                if dst_indexed {
-                    indexed_sgpr(d, &mut w)?;
-                    indexed_sgpr(d, &mut r)?;
-                    if !r.contains(&Reg::S(M0)) {
-                        r.push(Reg::S(M0));
-                    }
-                } else {
-                    regs(d, &mut w)?;
-                    // These change (or may keep) the destination's old value.
-                    if name.starts_with("s_bitset")
-                        || name.starts_with("s_cmov")
-                        || matches!(name, "s_addk_i32" | "s_mulk_i32")
-                    {
-                        regs(d, &mut r)?;
-                    }
+                regs(d, &mut w)?;
+                // These change (or may keep) the destination's old value.
+                if name.starts_with("s_bitset")
+                    || name.starts_with("s_cmov")
+                    || matches!(name, "s_addk_i32" | "s_mulk_i32")
+                {
+                    regs(d, &mut r)?;
                 }
             }
             if matches!(name, "s_addc_u32" | "s_subb_u32" | "s_cmovk_i32")
@@ -1635,176 +1546,6 @@ fn add_regs(op: &Operand, lanes: u8, out: &mut Vec<Reg>) -> Result<(), ()> {
 mod tests {
     use super::*;
 
-    fn reference_postorder(blocks: &[Block]) -> Vec<usize> {
-        let mut seen = vec![false; blocks.len()];
-        let mut post = Vec::with_capacity(blocks.len());
-        let mut stack = vec![(0, 0)];
-        seen[0] = true;
-        while let Some(top) = stack.last_mut() {
-            let (b, i) = *top;
-            top.1 += 1;
-            match blocks[b].exit.successors().get(i) {
-                Some(&s) if !seen[s] => {
-                    seen[s] = true;
-                    stack.push((s, 0));
-                }
-                Some(_) => {}
-                None => {
-                    post.push(b);
-                    stack.pop();
-                }
-            }
-        }
-        post.reverse();
-        post
-    }
-
-
-    #[test]
-    fn cfg_successors_preserve_order() {
-        for exit in [
-            Exit::End,
-            Exit::Indirect,
-            Exit::Jump(3),
-            Exit::Branch {
-                taken: 7,
-                not_taken: 2,
-            },
-            Exit::Branch {
-                taken: 4,
-                not_taken: 4,
-            },
-        ] {
-            assert_eq!(
-                exit.successor_iter().collect::<Vec<_>>(),
-                exit.successors()
-            );
-        }
-    }
-
-    fn synthetic_cfg(diamonds: usize) -> Vec<Block> {
-        let block = |exit| Block {
-            offset: 0,
-            preds: Vec::new(),
-            phis: Vec::new(),
-            insts: Vec::new(),
-            exit,
-        };
-
-        let mut blocks = Vec::new();
-
-        for i in 0..diamonds {
-            let base = i * 3;
-
-            blocks.push(block(Exit::Branch {
-                taken: base + 1,
-                not_taken: base + 2,
-            }));
-
-            blocks.push(block(Exit::Jump(base + 3)));
-
-            let exit = if i % 5 == 0 {
-                Exit::Branch {
-                    taken: base,
-                    not_taken: base + 3,
-                }
-            } else {
-                Exit::Jump(base + 3)
-            };
-
-            blocks.push(block(exit));
-        }
-
-        blocks.push(block(Exit::End));
-
-        // Unreachable block.
-        blocks.push(block(Exit::Jump(diamonds * 3 + 1)));
-
-        blocks
-    }
-
-    #[test]
-    fn cfg_postorder_matches_reference() {
-        for count in [0, 1, 2, 16, 128, 2048] {
-            let blocks = synthetic_cfg(count);
-
-            let expected = reference_postorder(&blocks);
-            let actual = reverse_postorder(&blocks);
-
-            assert_eq!(actual, expected);
-            assert_eq!(actual.len(), count * 3 + 1);
-        }
-    }
-
-    #[test]
-    #[ignore = "synthetic release microbenchmark"]
-    fn cfg_postorder_benchmark() {
-        use std::hint::black_box;
-        use std::time::Instant;
-
-        fn measure(
-            blocks: &[Block],
-            run: impl Fn(&[Block]) -> Vec<usize>,
-        ) -> f64 {
-            let start = Instant::now();
-
-            for _ in 0..128 {
-                black_box(run(black_box(blocks)));
-            }
-
-            start.elapsed().as_secs_f64() * 1000.0
-        }
-
-        for count in [256, 2048, 8192] {
-            let blocks = synthetic_cfg(count);
-
-            assert_eq!(
-                reference_postorder(&blocks),
-                reverse_postorder(&blocks)
-            );
-
-            black_box(measure(&blocks, reference_postorder));
-            black_box(measure(&blocks, reverse_postorder));
-
-            let mut original = Vec::new();
-            let mut candidate = Vec::new();
-
-            for round in 0..5 {
-                let (a, b) = if round % 2 == 0 {
-                    let a = measure(&blocks, reference_postorder);
-                    let b = measure(&blocks, reverse_postorder);
-                    (a, b)
-                } else {
-                    let b = measure(&blocks, reverse_postorder);
-                    let a = measure(&blocks, reference_postorder);
-                    (a, b)
-                };
-
-                original.push(a);
-                candidate.push(b);
-
-                println!(
-                    "blocks={} round={round}: \
-                    original={a:.3}ms candidate={b:.3}ms",
-                    blocks.len()
-                );
-            }
-
-            original.sort_by(f64::total_cmp);
-            candidate.sort_by(f64::total_cmp);
-
-            println!(
-                "MEDIAN blocks={}: \
-                 original={:.3}ms candidate={:.3}ms \
-                 speedup={:.3}x",
-                blocks.len(),
-                original[2],
-                candidate[2],
-                original[2] / candidate[2]
-            );
-        }
-    }
-
     const S_ENDPGM: u32 = 0xBF81_0000;
 
     fn build_words(words: &[u32], wave64: bool) -> Program {
@@ -1915,37 +1656,6 @@ mod tests {
     }
 
     #[test]
-    fn a_conditional_branch_to_its_fallthrough_has_one_edge() {
-        let p = build_words(
-            &[
-                0xBF06_0100, // s_cmp_eq_u32 s0, s1
-                0xBF85_0002, // s_cbranch_scc1 -> 16
-                0xBE82_0380, // s_mov_b32 s2, 0
-                0xBF82_0001, // s_branch -> 20
-                0xBF85_0000, // 16: both arms go to 20
-                0x7E00_0202, // 20: v_mov_b32 v0, s2
-                S_ENDPGM,
-            ],
-            true,
-        );
-        assert_eq!(p.blocks[2].exit, Exit::Jump(3));
-        let join = &p.blocks[3];
-        assert_eq!(join.preds, [1, 2]);
-        let [phi] = &join.phis[..] else {
-            panic!("expected one live phi, got {:?}", join.phis);
-        };
-        assert_eq!(phi.reg, Reg::S(2));
-        assert_eq!(
-            phi.args,
-            [
-                p.blocks[1].insts[0].write(Reg::S(2)).unwrap(),
-                input(&p, Reg::S(2)),
-            ],
-        );
-        assert_eq!(join.insts[0].read(Reg::S(2)), Some(phi.value));
-    }
-
-    #[test]
     fn in_place_scalar_ops_read_their_destination() {
         let p = build_words(
             &[
@@ -2006,46 +1716,6 @@ mod tests {
     }
 
     #[test]
-    fn loops_can_branch_to_offset_zero() {
-        let p = build_words(
-            &[
-                0x8000_8100, // 0: s_add_u32 s0, s0, 1
-                0xBF07_8400, // s_cmp_lg_u32 s0, 4
-                0xBF85_FFFD, // s_cbranch_scc1 -> 0
-                S_ENDPGM,
-            ],
-            false,
-        );
-        let [entry, header, end] = &p.blocks[..] else {
-            panic!("{:?}", p.blocks);
-        };
-        assert!(entry.preds.is_empty());
-        assert!(entry.insts.is_empty());
-        assert_eq!(entry.exit, Exit::Jump(1));
-        assert_eq!(header.offset, 0);
-        assert_eq!(header.preds, [0, 1]);
-        assert_eq!(
-            header.exit,
-            Exit::Branch {
-                taken: 1,
-                not_taken: 2,
-            }
-        );
-        assert_eq!(end.exit, Exit::End);
-        let [phi] = &header.phis[..] else {
-            panic!("{:?}", header.phis);
-        };
-        let add = &header.insts[0];
-        assert_eq!(phi.reg, Reg::S(0));
-        assert_eq!(
-            phi.args,
-            [input(&p, Reg::S(0)), add.write(Reg::S(0)).unwrap()]
-        );
-        assert_eq!(add.read(Reg::S(0)), Some(phi.value));
-        assert!(crate::structure::structure(&p).is_ok());
-    }
-
-    #[test]
     fn drops_scheduling_and_follows_far_jumps() {
         let p = build_words(
             &[
@@ -2074,7 +1744,7 @@ mod tests {
 
     #[test]
     fn reports_what_it_cannot_express() {
-        let code: Vec<u8> = [0xBE80_2F01_u32, S_ENDPGM] // s_movrels_b64 s0, s1
+        let code: Vec<u8> = [0xBE80_2E01_u32, S_ENDPGM] // s_movrels_b32 s0, s1
             .iter()
             .flat_map(|w| w.to_le_bytes())
             .collect();
@@ -2082,45 +1752,9 @@ mod tests {
             build(&code, false, 256),
             Err(ShaderError::Unsupported {
                 offset: 0,
-                what: "s_movrels_b64"
+                what: "s_movrels_b32"
             })
         );
-    }
-
-    #[test]
-    fn relative_sgpr_access_spans_up_to_106() {
-        let code: Vec<u8> = [
-            0xBE82_3001_u32, // s_movreld_b32 s2, s1: s[2 + m0] = s1
-            0xBE80_2E04,     // s_movrels_b32 s0, s4: s0 = s[4 + m0]
-            S_ENDPGM,
-        ]
-        .iter()
-        .flat_map(|w| w.to_le_bytes())
-        .collect();
-        let p = build(&code, false, 256).unwrap();
-        let [movreld, movrels, _] = &p.blocks[0].insts[..] else {
-            panic!()
-        };
-        let sgprs = |regs: &[(Reg, Value)]| -> Vec<u8> {
-            regs.iter()
-                .filter_map(|r| match r.0 {
-                    Reg::S(s) if s < 106 => Some(s),
-                    _ => None,
-                })
-                .collect()
-        };
-        let s2_to_105: Vec<u8> = (2..106).collect();
-        let s4_to_105: Vec<u8> = (4..106).collect();
-        assert_eq!(sgprs(&movreld.writes), s2_to_105);
-        let mut expected_reld_reads = vec![1];
-        expected_reld_reads.extend(2..106);
-        assert_eq!(sgprs(&movreld.reads), expected_reld_reads);
-        assert!(movreld.read(Reg::S(M0)).is_some());
-
-        assert_eq!(sgprs(&movrels.writes), [0]);
-        assert_eq!(sgprs(&movrels.reads), s4_to_105);
-        assert!(movrels.read(Reg::S(M0)).is_some());
-        assert_eq!(movrels.read(Reg::S(4)), movreld.write(Reg::S(4)));
     }
 
     #[test]
@@ -2153,205 +1787,5 @@ mod tests {
         assert_eq!(vgprs(&movrels.reads), [4, 5, 0]);
         assert_eq!(movrels.read(Reg::V(4)), movreld.write(Reg::V(4)));
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
-    }
-
-    const fn s_branch(simm16: i16) -> u32 {
-        0xBF82_0000 | simm16 as u16 as u32
-    }
-
-    const fn s_cbranch_scc1(simm16: i16) -> u32 {
-        0xBF85_0000 | simm16 as u16 as u32
-    }
-
-    #[test]
-    fn reverse_order_diamond_chain_eliminates_trivial_phis() {
-        const LAYERS: usize = 4096;
-        let mut reverse = vec![
-            0xBE81_0381, // s_mov_b32 s1, 1
-            0xBE82_0382, // s_mov_b32 s2, 2
-            s_branch(((LAYERS - 1) * 4) as i16),
-        ];
-        for k in 0..LAYERS {
-            reverse.extend([
-                0xBF06_0201, // s_cmp_eq_u32 s1, s2
-                s_cbranch_scc1(1),
-                0xBF80_0000, // s_nop 0
-                if k == 0 {
-                    s_branch((LAYERS * 4 - 4) as i16)
-                } else {
-                    s_branch(-8)
-                },
-            ]);
-        }
-        reverse.extend([0x8000_0201, S_ENDPGM]); // s_add_u32 s0, s1, s2
-
-        let mut forward = vec![
-            0xBE81_0381, // s_mov_b32 s1, 1
-            0xBE82_0382, // s_mov_b32 s2, 2
-            s_branch(0),
-        ];
-        for _ in 0..LAYERS {
-            forward.extend([
-                0xBF06_0201, // s_cmp_eq_u32 s1, s2
-                s_cbranch_scc1(1),
-                0xBF80_0000, // s_nop 0
-                s_branch(0),
-            ]);
-        }
-        forward.extend([0x8000_0201, S_ENDPGM]); // s_add_u32 s0, s1, s2
-
-        let rev = build_words(&reverse, false);
-        let fwd = build_words(&forward, false);
-        assert!(rev.inputs.is_empty(), "{:?}", rev.inputs);
-        assert!(fwd.inputs.is_empty(), "{:?}", fwd.inputs);
-        assert!(rev.blocks.iter().all(|b| b.phis.is_empty()));
-        assert!(fwd.blocks.iter().all(|b| b.phis.is_empty()));
-        assert_eq!(rev.blocks.len(), fwd.blocks.len());
-
-        let rev_s1 = rev.blocks[0].insts[0].write(Reg::S(1)).unwrap();
-        let rev_s2 = rev.blocks[0].insts[1].write(Reg::S(2)).unwrap();
-        let rev_exit = rev.blocks.last().unwrap();
-        assert_eq!(rev_exit.insts[0].name(), "s_add_u32");
-        assert_eq!(rev_exit.insts[0].read(Reg::S(1)), Some(rev_s1));
-        assert_eq!(rev_exit.insts[0].read(Reg::S(2)), Some(rev_s2));
-
-        let fwd_s1 = fwd.blocks[0].insts[0].write(Reg::S(1)).unwrap();
-        let fwd_s2 = fwd.blocks[0].insts[1].write(Reg::S(2)).unwrap();
-        let fwd_exit = fwd.blocks.last().unwrap();
-        assert_eq!(fwd_exit.insts[0].name(), "s_add_u32");
-        assert_eq!(fwd_exit.insts[0].read(Reg::S(1)), Some(fwd_s1));
-        assert_eq!(fwd_exit.insts[0].read(Reg::S(2)), Some(fwd_s2));
-    }
-
-    #[test]
-    fn remove_trivial_phis_compresses_reverse_chain_in_bounded_steps() {
-        const CHAIN: usize = 4096;
-        let mut template = build_words(&[0xBE80_0380, S_ENDPGM], false).blocks[0].insts[0].clone();
-        template.writes.clear();
-        let mut blocks = Vec::with_capacity(CHAIN);
-        for k in 0..CHAIN {
-            let v1 = Value(2 + 2 * k as u32);
-            let v2 = Value(3 + 2 * k as u32);
-            let (n1, n2) = if k + 1 < CHAIN {
-                (Value(2 + 2 * (k + 1) as u32), Value(3 + 2 * (k + 1) as u32))
-            } else {
-                (Value(0), Value(1))
-            };
-            let mut inst = template.clone();
-            inst.reads = vec![(Reg::S(1), v1), (Reg::S(2), v2)];
-            blocks.push(Block {
-                offset: k * 4,
-                preds: vec![],
-                phis: vec![
-                    Phi {
-                        reg: Reg::S(1),
-                        value: v1,
-                        args: vec![n1, n1],
-                    },
-                    Phi {
-                        reg: Reg::S(2),
-                        value: v2,
-                        args: vec![n2, n2],
-                    },
-                ],
-                insts: vec![inst],
-                exit: Exit::End,
-            });
-        }
-        let steps = remove_trivial_phis_steps(&mut blocks, 2 + 2 * CHAIN as u32);
-        assert!(blocks.iter().all(|b| b.phis.is_empty()));
-        assert!(
-            blocks
-                .iter()
-                .all(|b| b.insts[0].reads == [(Reg::S(1), Value(0)), (Reg::S(2), Value(1))])
-        );
-        assert!(steps < 100_000, "steps = {steps}");
-    }
-
-    #[test]
-    fn non_trivial_phis_preserve_compressed_representatives() {
-        const LAYERS: usize = 4;
-        let mut code = vec![
-            0xBE81_0381, // s_mov_b32 s1, 1
-            0xBE82_0382, // s_mov_b32 s2, 2
-            0xBF06_8000, // s_cmp_eq_u32 s0, 0
-            s_cbranch_scc1((2 + (LAYERS - 1) * 4) as i16),
-            0xBE81_0383, // s_mov_b32 s1, 3
-            s_branch((LAYERS * 4) as i16),
-        ];
-        for k in 0..LAYERS {
-            code.extend([
-                0xBF06_0201, // s_cmp_eq_u32 s1, s2
-                s_cbranch_scc1(1),
-                0xBF80_0000, // s_nop 0
-                if k == 0 {
-                    s_branch((LAYERS * 4 - 4) as i16)
-                } else {
-                    s_branch(-8)
-                },
-            ]);
-        }
-        code.extend([0x8000_0201, S_ENDPGM]); // s_add_u32 s0, s1, s2
-
-        let p = build_words(&code, false);
-        let entry_s1 = p.blocks[0].insts[0].write(Reg::S(1)).unwrap();
-        let entry_s2 = p.blocks[0].insts[1].write(Reg::S(2)).unwrap();
-        let arm_s1 = p.blocks[1].insts[0].write(Reg::S(1)).unwrap();
-        let merge = p.blocks.last().unwrap();
-        for b in &p.blocks[..p.blocks.len() - 1] {
-            assert!(b.phis.is_empty(), "{:?}", b.phis);
-        }
-        let [phi] = &merge.phis[..] else {
-            panic!("{:?}", merge.phis)
-        };
-        assert_eq!(phi.reg, Reg::S(1));
-        assert_eq!(phi.args, [arm_s1, entry_s1]);
-        assert_eq!(merge.insts[0].read(Reg::S(1)), Some(phi.value));
-        assert_eq!(merge.insts[0].read(Reg::S(2)), Some(entry_s2));
-
-        let mut loop_code = vec![
-            0xBE81_0381, // s_mov_b32 s1, 1
-            0xBE82_0382, // s_mov_b32 s2, 2
-            s_branch(((LAYERS - 1) * 4) as i16),
-        ];
-        for k in 0..LAYERS {
-            loop_code.extend([
-                0xBF06_0201, // s_cmp_eq_u32 s1, s2
-                s_cbranch_scc1(1),
-                0xBF80_0000, // s_nop 0
-                if k == 0 {
-                    s_branch((LAYERS * 4 - 4) as i16)
-                } else {
-                    s_branch(-8)
-                },
-            ]);
-        }
-        loop_code.extend([
-            0x8001_0201, // s_add_u32 s1, s1, s2
-            0xBF07_8401, // s_cmp_lg_u32 s1, 4
-            s_cbranch_scc1(-3),
-            0x8000_0201, // s_add_u32 s0, s1, s2
-            S_ENDPGM,
-        ]);
-
-        let lp = build_words(&loop_code, false);
-        let lp_s1 = lp.blocks[0].insts[0].write(Reg::S(1)).unwrap();
-        let lp_s2 = lp.blocks[0].insts[1].write(Reg::S(2)).unwrap();
-        let header = &lp.blocks[lp.blocks.len() - 2];
-        let exit = lp.blocks.last().unwrap();
-        for b in &lp.blocks[..lp.blocks.len() - 2] {
-            assert!(b.phis.is_empty(), "{:?}", b.phis);
-        }
-        assert!(exit.phis.is_empty(), "{:?}", exit.phis);
-        let [loop_phi] = &header.phis[..] else {
-            panic!("{:?}", header.phis)
-        };
-        let next_s1 = header.insts[0].write(Reg::S(1)).unwrap();
-        assert_eq!(loop_phi.reg, Reg::S(1));
-        assert_eq!(loop_phi.args, [lp_s1, next_s1]);
-        assert_eq!(header.insts[0].read(Reg::S(1)), Some(loop_phi.value));
-        assert_eq!(header.insts[0].read(Reg::S(2)), Some(lp_s2));
-        assert_eq!(exit.insts[0].read(Reg::S(1)), Some(next_s1));
-        assert_eq!(exit.insts[0].read(Reg::S(2)), Some(lp_s2));
     }
 }

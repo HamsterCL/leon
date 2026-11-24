@@ -17,11 +17,8 @@ extern "system" fn create_device(
     iid: *const Iid,
     out: *mut *const Object,
 ) -> HRESULT {
-    #[cfg(windows)]
-    {
-        victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
-        victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
-    }
+    victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
+    victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
     #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
     device::create(adapter, parameters, iid, out)
@@ -50,6 +47,33 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
     }
     #[cfg(not(windows))]
     let _ = dir;
+}
+
+/// Creates the host device, so shader translations made next match the
+/// ones a run makes. `false` without a host GPU.
+pub fn prepare_shader_host() -> bool {
+    #[cfg(windows)]
+    {
+        victory_gpu::shader_cache::prepare_host()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Puts one shader container in the shader cache; `true` when it had to be
+/// translated, `false` when the cache had it.
+pub fn prewarm_shader(container: &[u8]) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        victory_gpu::shader_cache::prewarm(container)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = container;
+        Err("no host GPU".into())
+    }
 }
 
 pub(crate) fn module() -> HleModule {

@@ -16,10 +16,6 @@ use crate::{io, ir, resource, structure};
 /// s0 (textures, or with `buffers` structured buffers of dwords, at entries
 /// 0 and 1, a raw UAV at entry 2) and the table of samplers at s1.
 fn build(words: &[u32], buffers: bool) -> HostShader {
-    build_with_handle_count(words, buffers, 1)
-}
-
-fn build_with_handle_count(words: &[u32], buffers: bool, nonuniform_handles: u32) -> HostShader {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -75,7 +71,8 @@ fn build_with_handle_count(words: &[u32], buffers: bool, nonuniform_handles: u32
         mesh_stride: 0,
     })
     .expect("lower");
-    assert_eq!(lowered.nonuniform_handles, nonuniform_handles);
+    // One access with each lane's own heap index, no wave operation.
+    assert_eq!(lowered.nonuniform_handles, 1);
     assert!(!lowered.wave_ops);
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -117,8 +114,7 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let force_warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
-    for &(label, warp) in super::valu_tests::backends(force_warp) {
+    for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
@@ -164,45 +160,6 @@ fn sampled(shader: &HostShader) -> Vec<(&'static str, Vec<f32>)> {
         .into_iter()
         .map(|(label, words)| (label, words.into_iter().map(f32::from_bits).collect()))
         .collect()
-}
-
-#[test]
-fn packed_image_load_keeps_unwritten_high_half() {
-    let texels = [[1.0, 2.0, 3.0, 4.0]];
-    let views = [
-        View::Texture(1, 1, &texels),
-        View::Texture(1, 1, &texels),
-        View::RawUav(32),
-    ];
-    for (dmask, reg, seed, want) in [
-        (1, 12, 0x5a5a_1234, 0x5a5a_3c00),
-        (3, 12, 0x5a5a_1234, 0x4000_3c00),
-        (7, 13, 0xdead_5678, 0xdead_4200),
-    ] {
-        let words = [
-            0xBE84_0300, // s_mov_b32 s4, s0
-            0xBE85_0380, // s_mov_b32 s5, 0
-            0xF408_0A02,
-            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
-            0xF40C_0302,
-            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0
-            0x7E04_0280, // v_mov_b32 v2, 0
-            0x7E06_0280, // v_mov_b32 v3, 0
-            0x7E00_02FF | reg << 17,
-            seed, // v_mov_b32 v[reg], seed
-            0xF000_0008 | dmask << 8,
-            0x8003_0C02, // image_load v12..., v[2:3], s[12:19] dim:2D d16
-            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
-            0xE070_1000,
-            0x800A_0010 | reg << 8, // buffer_store_dword v[reg], v16, s[40:43], 0 offen
-            0xBF81_0000, // s_endpgm
-        ];
-        let results = run(&build_with_handle_count(&words, false, 0), &views);
-        assert!(!results.is_empty(), "no SM 6.6 test adapter");
-        for (backend, got) in results {
-            assert_eq!(got, [want; 32], "{backend}: dmask {dmask:#x}");
-        }
-    }
 }
 
 #[test]
@@ -279,25 +236,6 @@ fn lanes_sample_the_entry_their_offset_names_in_the_console_waterfall() {
 }
 
 #[test]
-fn lanes_sample_the_entry_their_index_names_when_scaled_in_the_loop() {
-    use crate::resource::tests::{
-        WATERFALL_ADDED_BASE_INDEX_WAVE32, WATERFALL_SCALED_INDEX_WAVE32,
-    };
-    let want: Vec<f32> = (0..32).map(|l| [1.0, 2.0][l & 1]).collect();
-    for words in [
-        WATERFALL_SCALED_INDEX_WAVE32,
-        WATERFALL_ADDED_BASE_INDEX_WAVE32,
-    ] {
-        let shader = build(words, false);
-        let results = sampled(&shader);
-        assert!(!results.is_empty());
-        for (label, red) in results {
-            assert_eq!(red, want, "{label}");
-        }
-    }
-}
-
-#[test]
 fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
     use crate::resource::tests::cmpx_waterfall;
     // Lanes below 16 hold the first descriptor, the others the second.
@@ -309,28 +247,5 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
         for (label, red) in results {
             assert_eq!(red, want, "{label}, folded {folded}");
         }
-    }
-}
-
-#[test]
-fn lanes_sample_their_arm_after_a_redundant_masked_write() {
-    use crate::resource::tests::WATERFALL_JOINED_WAVE32;
-    let mut words = WATERFALL_JOINED_WAVE32.to_vec();
-    let at = words.iter().position(|&w| w == 0x887E_147E).unwrap() + 1;
-    words.splice(
-        at..at,
-        [
-            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0 (lane < 16)
-            0xBE92_3C6A, // s_and_saveexec_b32 s18, vcc_lo
-            0x7E08_0218, // v_mov_b32 v4, s24 (same word the then arm wrote)
-            0xBEFE_0312, // s_mov_b32 exec_lo, s18
-        ],
-    );
-    let shader = build(&words, false);
-    let results = sampled(&shader);
-    assert!(!results.is_empty());
-    let want: Vec<f32> = (0..32).map(|l| if l < 16 { 1.0 } else { 2.0 }).collect();
-    for (label, red) in results {
-        assert_eq!(red, want, "{label}");
     }
 }

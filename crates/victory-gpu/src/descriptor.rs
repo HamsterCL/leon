@@ -13,25 +13,6 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 #[cfg(windows)]
 pub(crate) mod host;
 
-/// Compares a fault address numerically with the recorded GPU handle ranges.
-#[cfg(any(windows, test))]
-fn describe_heap_ranges(va: u64, ranges: &[(u64, u64, u64, bool)]) -> String {
-    let mut text = String::new();
-    for &(start, bytes, step, sampler) in ranges {
-        let kind = if sampler { "sampler" } else { "view" };
-        let place = match va.checked_sub(start) {
-            None => format!("{:#x} below", start - va),
-            Some(offset) if offset < bytes => format!("inside, slot {}", offset / step),
-            Some(offset) if offset == bytes => "at the end".to_owned(),
-            Some(offset) => format!("{:#x} past its end", offset - bytes),
-        };
-        text.push_str(&format!(
-            "; {kind} heap {start:#x}+{bytes:#x} (recorded handle range): {place}"
-        ));
-    }
-    text
-}
-
 const HEAP_IIDS: [Iid; 4] = [
     guid(
         0x8efb471d,
@@ -772,9 +753,10 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 
 /// Device method.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    let [lo, hi, size, _] = words(desc).unwrap_or_default();
-    let address = u64::from(lo) | u64::from(hi) << 32;
-    record(handle, View::Constant(address, size));
+    if let Some([lo, hi, size, _]) = words(desc) {
+        let address = u64::from(lo) | u64::from(hi) << 32;
+        record(handle, View::Constant(address, size));
+    }
 }
 
 /// Device method.
@@ -1011,40 +993,6 @@ mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
 
-    #[test]
-    fn fault_addresses_only_get_slots_inside_recorded_heap_ranges() {
-        let view = [(0x1000, 0x80, 32, false)];
-        let sampler = (0x1040, 0x80, 16, true);
-        for (address, placement, slot) in [
-            (0xffc, "0x4 below", None),
-            (0x1000, "inside", Some("slot 0")),
-            (0x107f, "inside", Some("slot 3")),
-            (0x1080, "at the end", None),
-            (0x4_0000_1080, "0x400000000 past", None),
-        ] {
-            let note = describe_heap_ranges(address, &view);
-            match slot {
-                Some(slot) => assert!(note.contains(slot), "{note}"),
-                None => assert!(!note.contains("slot"), "{note}"),
-            }
-            assert!(note.contains(placement), "{note}");
-        }
-
-        let note = describe_heap_ranges(0x4_0000_10c0, &[view[0], sampler]);
-        assert_eq!(note.matches("past").count(), 2, "{note}");
-        assert!(!note.contains("slot"), "{note}");
-
-        let note = describe_heap_ranges(0x1050, &[view[0], sampler]);
-        assert!(
-            note.contains("view heap 0x1000+0x80 (recorded handle range): inside, slot 2"),
-            "{note}"
-        );
-        assert!(
-            note.contains("sampler heap 0x1040+0x80 (recorded handle range): inside, slot 1"),
-            "{note}"
-        );
-    }
-
     /// What newer titles pass; tests use it throughout, so that reading the
     /// placement stays inside the value.
     #[repr(C)]
@@ -1053,17 +1001,6 @@ mod tests {
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
-    }
-
-    #[test]
-    fn a_null_cbv_overwrites_the_previous_descriptor() {
-        let mut slot = [0u64; 4];
-        let handle = slot.as_mut_ptr() as u64;
-        create_cbv(std::ptr::null(), &[0x1000, 0, 256, 0], handle);
-        assert_eq!(view(handle), Some(View::Constant(0x1000, 256)));
-
-        create_cbv(std::ptr::null(), std::ptr::null(), handle);
-        assert_eq!(view(handle), Some(View::Constant(0, 0)));
     }
 
     #[test]

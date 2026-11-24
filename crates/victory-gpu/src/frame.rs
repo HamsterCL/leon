@@ -92,12 +92,10 @@ fn last(kind: u32) -> &'static AtomicU64 {
     &LAST[(kind as usize).min(LAST.len() - 1)]
 }
 
-/// The next tick after now and after the last one a wait for `kind` took
-/// (an event happens once per tick: a wait woken a little early must not
-/// let the next one end on the same tick), and how long until it. A wait
-/// that comes within `limit` takes the tick here, under the clock's lock,
-/// so two threads waiting for one kind never take the same tick.
-fn next_tick(kind: u32, limit: Duration) -> (u64, Duration) {
+/// The next tick after now and after the last one a wait for `kind` ended
+/// on (an event happens once per tick: a wait woken a little early must not
+/// let the next one end on the same tick), and how long until it.
+fn next_tick(kind: u32) -> (u64, Duration) {
     let mut clock = clock();
     let c = clock.get_or_insert_with(|| Clock {
         start: Instant::now(),
@@ -106,25 +104,13 @@ fn next_tick(kind: u32, limit: Duration) -> (u64, Duration) {
     });
     let elapsed = c.start.elapsed().as_nanos();
     let interval = c.interval.as_nanos().max(1);
-    let last_tick = last(kind).load(Ordering::Relaxed);
-    // The tick most recently passed. A flip (or vblank) wait that begins
-    // after a tick nobody has taken yet is late: the frame took longer than
-    // an interval. It ends at once on that tick instead of waiting for the
-    // following one, so a frame a little over budget costs that much more,
-    // not a whole extra interval (30 fps falling straight to 15).
-    let passed = c.first + (elapsed / interval) as u64;
-    if kind != ORIGIN && passed > last_tick && passed > c.first {
-        // Taken here, under the lock, like any other tick.
-        last(kind).fetch_max(passed, Ordering::Relaxed);
-        return (passed, Duration::ZERO);
-    }
-    let tick = (c.first + (elapsed / interval + 1) as u64).max(last_tick + 1);
+    let tick =
+        (c.first + (elapsed / interval + 1) as u64).max(last(kind).load(Ordering::Relaxed) + 1);
     let at = u128::from(tick - c.first) * interval;
-    let wait = Duration::from_nanos(at.saturating_sub(elapsed) as u64);
-    if wait <= limit {
-        last(kind).fetch_max(tick, Ordering::Relaxed);
-    }
-    (tick, wait)
+    (
+        tick,
+        Duration::from_nanos(at.saturating_sub(elapsed) as u64),
+    )
 }
 
 /// Device method: blocks until the next tick (or the time-out); an origin
@@ -161,6 +147,7 @@ pub(crate) extern "system" fn wait(
         TIMEOUT
     } else {
         std::thread::sleep(wait);
+        last(kind).fetch_max(tick, Ordering::Relaxed);
         S_OK
     };
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -253,38 +240,7 @@ mod tests {
             .collect();
         assert!(flips.windows(2).all(|w| w[1] == w[0] + 1), "{flips:?}");
         // Even when a flip wait begins on the tick another just ended on.
-        let (tick, _) = next_tick(FLIP, Duration::ZERO);
+        let (tick, _) = next_tick(FLIP);
         assert!(tick > flips[3]);
-
-        // A frame over budget: its flip wait begins after a tick nobody
-        // took and ends at once on it, not on the tick after.
-        assert_eq!(set_interval(null, null, 20_000, 1, 0), S_OK);
-        assert_eq!(
-            wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token),
-            S_OK
-        );
-        let flipped = LAST[2].load(Ordering::Relaxed);
-        std::thread::sleep(Duration::from_millis(25));
-        let late = Instant::now();
-        assert_eq!(
-            wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token),
-            S_OK
-        );
-        assert!(late.elapsed() < Duration::from_millis(10));
-        assert_eq!(LAST[2].load(Ordering::Relaxed), flipped + 1);
-    }
-
-    /// Two waits for one kind that begin together (two threads) take two
-    /// ticks: the first takes its tick before it sleeps. A time-out takes
-    /// none. The old code marked the tick after the sleep, so both got it.
-    #[test]
-    fn waits_begun_together_take_different_ticks() {
-        const VBLANK: u32 = 1;
-        let long = Duration::from_secs(1);
-        let (first, _) = next_tick(VBLANK, long);
-        let (second, _) = next_tick(VBLANK, long);
-        assert!(second > first, "{second} after {first}");
-        next_tick(VBLANK, Duration::ZERO);
-        assert_eq!(last(VBLANK).load(Ordering::Relaxed), second);
     }
 }

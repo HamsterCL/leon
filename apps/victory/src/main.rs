@@ -5,11 +5,11 @@
 
 mod census;
 mod inspect;
+mod prewarm;
 mod run;
 mod shader;
 mod translate;
 
-use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -79,12 +79,20 @@ enum Command {
         /// Also create a host D3D12 pipeline for each emitted shader.
         #[arg(long)]
         pipelines: bool,
-        /// Include runtime hashes and duplicate DXIL containers in the per-program listing.
+        /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
-        /// Positive worker thread count (default: every logical core).
+        /// Worker threads (default: every logical core).
         #[arg(long)]
-        jobs: Option<NonZeroUsize>,
+        jobs: Option<usize>,
+    },
+    /// Translate the game's shaders into the cache before a run, with a
+    /// progress line (default: `shaders.rpf` of the configured game).
+    Prewarm {
+        paths: Vec<PathBuf>,
+        /// Worker threads (default: every logical core).
+        #[arg(long)]
+        jobs: Option<usize>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -98,6 +106,10 @@ enum Command {
         /// Actually start the title. Without it, stop after binding.
         #[arg(long)]
         execute: bool,
+        /// Translate the game's shaders into the cache first, with a
+        /// progress line, so the run finds them there.
+        #[arg(long)]
+        prewarm: bool,
         /// The console model the title sees (device type, memory).
         #[arg(long, value_enum, default_value_t = Console::SeriesX)]
         console: Console,
@@ -164,21 +176,16 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
+        Command::Prewarm { paths, jobs } => prewarm::run(paths, jobs),
         Command::Run {
             exe,
             unimplemented,
             strict,
             execute,
+            prewarm,
             console,
             title_args: _,
-        } => {
-            let code = run::run(&exe, unimplemented, strict, execute, console)?;
-            if code != 0 {
-                // Preserve all 32 bits of the Windows process status.
-                std::process::exit(code as i32);
-            }
-            Ok(())
-        }
+        } => run::run(&exe, unimplemented, strict, execute, prewarm, console),
         Command::Config => show_config(),
     }
 }
@@ -196,21 +203,11 @@ fn show_config() -> Result<()> {
             .as_ref()
             .map_or("(none)".into(), |p| p.display().to_string())
     );
-    // Where each value came from, so it is clear which setting to change.
-    let o = cfg.origins;
-    println!("game_dir    : {}  [{}]", status(&cfg.game_dir), o.game_dir);
-    println!(
-        "cache_dir   : {}  [{}]",
-        cfg.cache_dir.display(),
-        o.cache_dir
-    );
-    println!("data_dir    : {}  [{}]", cfg.data_dir.display(), o.data_dir);
+    println!("game_dir    : {}", status(&cfg.game_dir));
+    println!("cache_dir   : {}", cfg.cache_dir.display());
+    println!("data_dir    : {}", cfg.data_dir.display());
     for t in &cfg.test_titles {
-        println!(
-            "test_title  : {}  [{}]",
-            status(&Some(t.clone())),
-            o.test_titles
-        );
+        println!("test_title  : {}", status(&Some(t.clone())));
     }
     for p in cfg
         .game_dir
@@ -236,35 +233,5 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         !all.is_empty(),
         "no paths given and none configured (see victory.example.toml)"
     );
-    for p in &all {
-        victory_core::ensure_outside_repo(p)?;
-    }
     Ok(all)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_paths_accepts_cli_paths() {
-        // CLI paths may include synthetic in-tree test fixtures.
-        let inside = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let res = default_paths(vec![inside.clone()]).unwrap();
-        assert_eq!(res, vec![inside]);
-    }
-
-    #[test]
-    fn default_paths_accepts_outside_path() {
-        let outside = std::env::temp_dir();
-        let res = default_paths(vec![outside.clone()]).unwrap();
-        assert_eq!(res, vec![outside]);
-    }
-
-    #[test]
-    fn default_paths_rejects_configured_inside_repo() {
-        let inside = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let err = victory_core::ensure_outside_repo(&inside).unwrap_err();
-        assert!(err.to_string().contains("inside"));
-    }
 }

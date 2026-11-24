@@ -235,32 +235,19 @@ impl Instruction {
             }
             Encoding::Sopp => Fields::Sopp { imm: w0 as u16 },
             Encoding::Smem => {
-                let sdata = (w0 >> 6 & 0x7F) as u8;
-                // s_atc_probe*: SDATA is a 7-bit immediate, not an SGPR. The
-                // buffer form's resource is 4 dwords. GLC and DLC are not operands.
-                let probe = matches!(name, "s_atc_probe" | "s_atc_probe_buffer");
-                let data = if probe {
-                    Some(Operand::Literal(u32::from(sdata)))
-                } else {
-                    match name {
-                        "s_gl1_inv" | "s_dcache_inv" | "s_dcache_wb" => None,
-                        n if n.starts_with("s_dcache_discard") => None,
-                        "s_memtime" | "s_memrealtime" => Some(scalar(sdata, 2)),
-                        _ => Some(scalar(sdata, data_dwords(name))),
-                    }
+                let data = match name {
+                    "s_gl1_inv" | "s_dcache_inv" | "s_dcache_wb" => None,
+                    n if n.starts_with("s_dcache_discard") => None,
+                    "s_memtime" | "s_memrealtime" => Some(2),
+                    _ => Some(data_dwords(name)),
                 };
-                let base =
-                    2 + 2 * u8::from(name.starts_with("s_buffer_") || name == "s_atc_probe_buffer");
+                let base = 2 + 2 * u8::from(name.starts_with("s_buffer_"));
                 Fields::Smem {
-                    data,
+                    data: data.map(|d| scalar((w0 >> 6 & 0x7F) as u8, d)),
                     base: scalar(((w0 & 0x3F) << 1) as u8, base),
                     offset: (w1 << 11) as i32 >> 11,
                     soffset: scalar((w1 >> 25) as u8, 1),
-                    cache: if probe {
-                        Cache::default()
-                    } else {
-                        cache(bit(w0, 16), false, bit(w0, 14))
-                    },
+                    cache: cache(bit(w0, 16), false, bit(w0, 14)),
                 }
             }
             Encoding::Vop1 | Encoding::Vop2 | Encoding::Vopc | Encoding::Vop3 | Encoding::Vop3p => {
@@ -313,11 +300,7 @@ impl Instruction {
                             | "ds_gws_sema_release_all"
                     ) {
                     0
-                } else if pair
-                    || name.contains("cmpst")
-                    || name.contains("mskor")
-                    || name == "ds_wrap_rtn_b32"
-                {
+                } else if pair || name.contains("cmpst") || name.contains("mskor") {
                     2
                 } else {
                     1
@@ -824,15 +807,9 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
     } else if name.contains("_mip") {
         packed += 1;
     }
-    // On GFX10.3, `a16` packs coordinates/LOD/clamp into 16-bit pairs (and
-    // bias stays in its own VGPR as an f16 in the low half), while derivatives
-    // remain 32-bit unless the opcode is a `_g16` form.
-    let g16 = name.ends_with("_g16");
-    let deriv_dwords = if g16 {
-        2 * derivs.div_ceil(2)
+    if a16 {
+        whole + 2 * derivs.div_ceil(2) + packed.div_ceil(2)
     } else {
-        2 * derivs
-    };
-    let coord_dwords = if a16 { packed.div_ceil(2) } else { packed };
-    whole + deriv_dwords + coord_dwords
+        whole + 2 * derivs + packed
+    }
 }

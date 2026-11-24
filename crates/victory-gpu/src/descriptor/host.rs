@@ -482,63 +482,27 @@ fn view_stride(view: &View) -> Option<u32> {
     })
 }
 
-/// Free-slot tracker separating top-down single-slot (`n == 1`) and bottom-up
-/// multi-slot (`n > 1`) allocations inside the dynamic descriptor range.
-struct DynamicPool {
-    /// Bottom-up search cursor for multi-slot tables (`n > 1`).
-    head: usize,
-    /// Top-down search cursor for single-slot allocations (`n == 1`) so
-    /// single-slot views do not fragment multi-slot table space.
-    tail: usize,
-    taken: Vec<bool>,
-}
-
-impl DynamicPool {
-    fn new(cap: usize) -> Self {
-        Self {
-            head: 0,
-            tail: cap,
-            taken: vec![false; cap],
-        }
-    }
-
-    fn alloc(&mut self, n: usize) -> Option<usize> {
-        if n == 0 || n > self.taken.len() {
-            return None;
-        }
-        let first = if n == 1 {
-            let slot = free_single(&self.taken, self.tail)?;
-            self.taken[slot] = true;
-            self.tail = slot;
-            slot
-        } else {
-            let first = free_table(&self.taken, self.head, n)?;
-            self.taken[first..first + n].fill(true);
-            self.head = (first + n) % self.taken.len();
-            first
-        };
-        Some(first)
-    }
-
-    fn release(&mut self, at: u32, n: u32) {
-        let cap = self.taken.len();
-        let start = (at as usize).min(cap);
-        let end = (at.saturating_add(n) as usize).min(cap);
-        if start < end {
-            self.taken[start..end].fill(false);
-        }
-    }
-}
-
-/// Recorded GPU handle ranges (start, length, increment, sampler) for
-/// device-removed reports. A range can outlive its heap.
+/// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
+/// device-removed reports: a shader indexing a heap past its end faults.
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
 
 /// For device-removed reports: where host GPU address `va` lies against
 /// the host descriptor heaps.
 pub(crate) fn near_heaps(va: u64) -> String {
     let ranges = GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner());
-    super::describe_heap_ranges(va, &ranges)
+    let mut text = String::new();
+    for &(start, bytes, step, sampler) in ranges.iter() {
+        let kind = if sampler { "sampler" } else { "view" };
+        let place = if va < start {
+            format!("{:#x} below", start - va)
+        } else if va < start + bytes {
+            format!("inside, slot {}", (va - start) / step)
+        } else {
+            format!("{:#x} past its end (slot {})", va - start - bytes, (va - start) / step)
+        };
+        text.push_str(&format!("; {kind} heap {start:#x}+{bytes:#x}: {place}"));
+    }
+    text
 }
 
 /// The host's limit for shader-visible view heaps on resource binding
@@ -633,7 +597,7 @@ impl HostHeap {
                 host.device.GetDescriptorHandleIncrementSize(kind),
             )
         };
-        tracing::debug!(requested, count, sampler, "host descriptor heap");
+        tracing::debug!(count, sampler, "host descriptor heap");
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
@@ -685,12 +649,6 @@ impl HostHeap {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
-        // One statistic per call site, so one site per name.
-        if sampler {
-            victory_profile::record!("gpu", "sampler heap", count + extra, started.elapsed());
-        } else {
-            victory_profile::record!("gpu", "view heap", count + extra, started.elapsed());
-        }
         Some(h)
     }
 
@@ -1139,77 +1097,6 @@ impl HostHeap {
         self.keep(index, None);
     }
 
-    /// Makes slot `index` a null descriptor matching the resource kind and
-    /// buffer/texture class (`dwords == 4` -> buffer, `8` -> texture) that
-    /// the translated shader declares for that slot. Avoids GPU device
-    /// removal on NVIDIA when an unwritten slot is read as a UAV, CBV, or
-    /// buffer SRV instead of a 2D texture SRV.
-    pub(crate) fn make_null_for_used(
-        &self,
-        index: u32,
-        used: Option<&victory_shader::UsedResource>,
-    ) {
-        use victory_shader::ResourceType;
-        if self.sampler {
-            self.make_null(index);
-            return;
-        }
-        let Some(u) = used else {
-            self.make_null(index);
-            return;
-        };
-        let is_buffer = u.dwords == 4;
-        // Sentinel keys have generation == 0 (real view keys start at generation 1).
-        let sentinel: u64 = match (u.kind, is_buffer) {
-            (ResourceType::Cbv, _) => 1,
-            (ResourceType::Srv, true) => 2,
-            (ResourceType::Srv, false) => 3,
-            (ResourceType::Uav, true) => 4,
-            (ResourceType::Uav, false) => 5,
-            (ResourceType::Sampler | ResourceType::Other(_), _) => return,
-        };
-        if (index as usize) < self.count as usize {
-            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            if made[index as usize] == sentinel {
-                return;
-            }
-            made[index as usize] = sentinel;
-        }
-        self.keep(index, None);
-        let at = self.cpu(index);
-        let Some(host) = host() else { return };
-        match (u.kind, is_buffer) {
-            (ResourceType::Cbv, _) => {
-                let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
-                // SAFETY: a slot of our heap; zero location makes a null CBV.
-                unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
-            }
-            (ResourceType::Srv, true) => null_buffer_view(at),
-            (ResourceType::Srv, false) => null_view(at),
-            (ResourceType::Uav, true) | (ResourceType::Uav, false) => {
-                let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-                    Format: DXGI_FORMAT_R32_UINT,
-                    ViewDimension: if is_buffer {
-                        D3D12_UAV_DIMENSION_BUFFER
-                    } else {
-                        D3D12_UAV_DIMENSION_TEXTURE2D
-                    },
-                    ..Default::default()
-                };
-                // SAFETY: a slot of our heap; null resource is valid with a desc.
-                unsafe {
-                    host.device.CreateUnorderedAccessView(
-                        None::<&ID3D12Resource>,
-                        None::<&ID3D12Resource>,
-                        Some(&desc),
-                        at,
-                    );
-                }
-            }
-            (ResourceType::Sampler | ResourceType::Other(_), _) => {}
-        }
-    }
-
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
@@ -1339,54 +1226,6 @@ impl HostHeap {
             host.device
                 .CreateConstantBufferView(Some(&desc), self.cpu(index))
         };
-    }
-
-    /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
-    /// of `buffer` from byte `offset` (a multiple of 16): a root SRV with a
-    /// size, whose reads past it return zeros instead of reaching whatever
-    /// the host placed after the buffer.
-    pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
-        let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
-        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: DXGI_FORMAT_R32_TYPELESS,
-            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
-            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                Buffer: D3D12_BUFFER_SRV {
-                    FirstElement: offset / 4,
-                    NumElements: elements,
-                    StructureByteStride: 0,
-                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
-                },
-            },
-        };
-        // SAFETY: a slot of our heap and a live buffer covering the range.
-        unsafe {
-            host.device
-                .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index))
-        };
-        self.keep(index, Some(buffer.clone()));
-    }
-
-    /// Makes slot `index` a raw buffer view that reads zeros.
-    pub(crate) fn null_raw_at(&self, index: u32) {
-        null_buffer_view(self.cpu(index));
-        self.keep(index, None);
-    }
-
-    /// Whether this is a sampler heap.
-    pub(crate) fn is_sampler(&self) -> bool {
-        self.sampler
-    }
-
-    /// The shader-visible handle of slot `index`.
-    pub(crate) fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
-        // SAFETY: a live shader-visible heap.
-        let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart().ptr };
-        D3D12_GPU_DESCRIPTOR_HANDLE {
-            ptr: start + u64::from(index) * u64::from(self.step),
-        }
     }
 
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
@@ -1659,15 +1498,6 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     ))
 }
 
-/// Whether a raw buffer view may start at element `first` (4 bytes each):
-/// the host wants 16-byte aligned starts, the console only 4, and refuses
-/// the call (removing the device) for the rest.
-/// shortcut: a view the host refuses reads nothing (a null view); starting
-/// it 16 bytes lower would need the shader to add the difference.
-fn raw_start_fits(first: u64) -> bool {
-    first.is_multiple_of(4)
-}
-
 /// The host resource a slot made by [`make`] views, if any.
 type Kept = Option<ID3D12Resource>;
 
@@ -1872,43 +1702,14 @@ fn buffer_uav(
     Some(Some(shadow.buffer.clone()))
 }
 
-/// Whether the host lets views of a typed resource name another format of
-/// its family (`CastingFullyTypedFormatSupported`; never SNORM for UNORM,
-/// nor FLOAT for another type), which [`fits`] uses for sRGB and linear
-/// twins only.
-fn casts_typed() -> bool {
-    static CASTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CASTS.get_or_init(|| {
-        let Some(host) = host() else { return false };
-        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
-        // SAFETY: the query writes its own structure of the given size.
-        let asked = unsafe {
-            host.device.CheckFeatureSupport(
-                D3D12_FEATURE_D3D12_OPTIONS3,
-                (&raw mut options).cast(),
-                size_of_val(&options) as u32,
-            )
-        };
-        let casts = asked.is_ok() && options.CastingFullyTypedFormatSupported.as_bool();
-        if !casts {
-            tracing::warn!(
-                "the host does not cast typed formats: sRGB views of linear textures (and the reverse) read in the texture's own format"
-            );
-        }
-        casts
-    })
-}
-
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
 /// resource's permission, of typed depth, and in another format than a
-/// typed resource's, but for casts it allows (see [`casts_typed`]). A view
-/// of a typed texture in another format of its family takes the texture's
-/// format, unless it is the texture's sRGB or linear twin and the host
-/// casts: then the hardware converts (or not) as the console does.
-/// shortcut: other casts within a family (UINT of UNORM, say) read as the
-/// texture's own format.
+/// typed resource's. A view of a typed texture in another format of its
+/// family takes the texture's format.
+/// shortcut: such a view (sRGB of UNORM, say) reads without its
+/// conversion; cast with castable formats if colors come out wrong.
 fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.
@@ -1942,14 +1743,6 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         format.0 = linear as i32;
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
-    // Packed 16-bit color textures stored as R16_TYPELESS (53) on NVIDIA.
-    if own == 53 && matches!(view, 0 | 86 | 115) {
-        if let Some(format) = format {
-            format.0 = if unordered { 57 } else { 56 }; // R16_UINT / R16_UNORM
-            return true;
-        }
-        return false;
-    }
     if view == 0 {
         return !typeless;
     }
@@ -1965,12 +1758,8 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         once!(view, own, "view format of another family");
         return false;
     }
-    let twin = crate::resource::SRGB
-        .iter()
-        .any(|&(s, l)| (s, l) == (view, own) || (l, s) == (view, own));
     if let Some(format) = format
         && !typeless
-        && !(twin && casts_typed())
     {
         *format = d.Format;
     }
@@ -2050,8 +1839,6 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
     match view {
-        // make_at and the mirror path write a typed null for this view.
-        View::Constant(0, _) => None,
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
@@ -2160,7 +1947,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 None => texture,
             };
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
-                return depth_scratch(device, texture, desc, at);
+                return None;
             }
             // SAFETY: a live texture and a slot of our heap.
             unsafe {
@@ -2422,44 +2209,6 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
 }
 
-/// Total free slots and the longest contiguous run in the dynamic pool.
-fn free_space(taken: &[bool]) -> (usize, usize) {
-    let mut free = 0;
-    let mut longest = 0;
-    for gap in taken.split(|&held| held) {
-        free += gap.len();
-        longest = longest.max(gap.len());
-    }
-    (free, longest)
-}
-
-/// Top-down scan from `cursor` for single-slot allocations (`n == 1`) so
-/// per-view dynamic slots cluster away from bottom-up multi-slot tables.
-fn free_single(taken: &[bool], cursor: usize) -> Option<usize> {
-    let split = cursor.min(taken.len());
-    (0..split)
-        .rev()
-        .chain((split..taken.len()).rev())
-        .find(|&i| !taken[i])
-}
-
-/// First contiguous run of `n` free slots from `cursor`, wrapping from slot 0
-/// without crossing the end of `taken`.
-fn free_table(taken: &[bool], cursor: usize, n: usize) -> Option<usize> {
-    let end = taken.len().checked_sub(n)? + 1;
-    let split = cursor.min(end);
-    for starts in [split..end, 0..split] {
-        let mut first = starts.start;
-        while first < starts.end {
-            match taken[first..first + n].iter().position(|&held| held) {
-                Some(offset) => first += offset + 1,
-                None => return Some(first),
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2521,103 +2270,6 @@ mod tests {
         };
         let view = View::Unordered(0, 0, Some([28, 8, 0, 0, 0, 0, 0, 0, 0, 0]));
         null_for(&view, heap.cpu(0));
-        // SAFETY: a plain device query.
-        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
-    }
-
-    /// Raw views start on 16 bytes on the host: element (4 bytes) 0, 4, 8...
-    /// The rest, 4, 8 and 12 bytes past a boundary as in the user report
-    /// (FirstElement 42261210), are refused.
-    #[test]
-    fn raw_views_start_on_16_bytes() {
-        for first in [0, 4, 8, 42_261_208, 42_261_212] {
-            assert!(raw_start_fits(first), "{first}");
-        }
-        for first in [1, 2, 3, 5, 42_261_209, 42_261_210, 42_261_211] {
-            assert!(!raw_start_fits(first), "{first}");
-        }
-    }
-
-    /// The raw views the check lets through, at starts other than 0, are
-    /// made on the real device as SRVs and UAVs and leave it alive.
-    #[test]
-    fn raw_views_that_fit_are_accepted_by_the_device() {
-        let Some(host) = host() else {
-            return; // no host GPU
-        };
-        let Some(heap) = HostHeap::new(false, 4) else {
-            return;
-        };
-        let properties = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_DEFAULT,
-            ..Default::default()
-        };
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: 1024,
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            ..Default::default()
-        };
-        let mut buffer: Option<ID3D12Resource> = None;
-        // SAFETY: plain creation from valid descriptions.
-        unsafe {
-            host.device.CreateCommittedResource(
-                &properties,
-                D3D12_HEAP_FLAG_NONE,
-                &desc,
-                D3D12_RESOURCE_STATE_COMMON,
-                None,
-                &mut buffer,
-            )
-        }
-        .expect("buffer");
-        let buffer = buffer.expect("buffer");
-        for first in (0..64).filter(|&f| raw_start_fits(f)) {
-            let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                Format: DXGI_FORMAT_R32_TYPELESS,
-                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
-                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                    Buffer: D3D12_BUFFER_SRV {
-                        FirstElement: first,
-                        NumElements: 16,
-                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
-                        ..Default::default()
-                    },
-                },
-            };
-            let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-                Format: DXGI_FORMAT_R32_TYPELESS,
-                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
-                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-                    Buffer: D3D12_BUFFER_UAV {
-                        FirstElement: first,
-                        NumElements: 16,
-                        Flags: D3D12_BUFFER_UAV_FLAG_RAW,
-                        ..Default::default()
-                    },
-                },
-            };
-            // SAFETY: a live buffer and slots of our heap.
-            unsafe {
-                host.device
-                    .CreateShaderResourceView(&buffer, Some(&srv), heap.cpu(0));
-                host.device.CreateUnorderedAccessView(
-                    &buffer,
-                    None::<&ID3D12Resource>,
-                    Some(&uav),
-                    heap.cpu(1),
-                );
-            }
-        }
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
@@ -2817,184 +2469,5 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
-    }
-
-    #[test]
-    fn free_space_counts_separate_runs_at_the_heap_ends() {
-        assert_eq!(free_space(&[true; 8]), (0, 0));
-        assert_eq!(free_space(&[false; 8]), (8, 8));
-        let fragmented = [false, false, true, false, true, false, false, false];
-        assert_eq!(free_space(&fragmented), (6, 3));
-    }
-
-    #[test]
-    fn free_table_chooses_the_first_contiguous_fit_in_cursor_order() {
-        for mask in 0u16..256 {
-            let taken: [bool; 8] = std::array::from_fn(|slot| mask & (1 << slot) != 0);
-            for cursor in 0..taken.len() {
-                for n in 1..=taken.len() {
-                    let expected = (cursor..taken.len()).chain(0..cursor).find(|&start| {
-                        taken
-                            .get(start..start + n)
-                            .is_some_and(|table| table.iter().all(|&held| !held))
-                    });
-                    assert_eq!(
-                        free_table(&taken, cursor, n),
-                        expected,
-                        "{mask:#x} {cursor} {n}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn dynamic_pool_segregates_singles_and_tables_to_exhaustion_without_overlap() {
-        let cap = 64usize;
-        let mut pool = DynamicPool::new(cap);
-        let mut held = vec![false; cap];
-        let mark = |held: &mut [bool], first: usize, n: usize, used: bool| {
-            for (offset, cell) in held[first..first + n].iter_mut().enumerate() {
-                assert_ne!(
-                    *cell, used,
-                    "slot {} overlap or double-free",
-                    first + offset
-                );
-                *cell = used;
-            }
-        };
-
-        // 1-slot allocations start from the top; multi-slot tables from the bottom.
-        let s0 = pool.alloc(1).unwrap();
-        let s1 = pool.alloc(1).unwrap();
-        assert_eq!((s0, s1), (cap - 1, cap - 2));
-        mark(&mut held, s0, 1, true);
-        mark(&mut held, s1, 1, true);
-
-        let t0 = pool.alloc(13).unwrap();
-        let t1 = pool.alloc(13).unwrap();
-        assert_eq!((t0, t1), (0, 13));
-        mark(&mut held, t0, 13, true);
-        mark(&mut held, t1, 13, true);
-
-        // Freeing single-slot holes leaves the contiguous middle range intact for tables.
-        pool.release(s0 as u32, 1);
-        mark(&mut held, s0, 1, false);
-        let s2 = pool.alloc(1).unwrap();
-        assert_eq!(s2, cap - 3);
-        mark(&mut held, s2, 1, true);
-
-        // Fill remaining contiguous table room cleanly up to the single-slot boundary,
-        // leaving one boundary slot plus the released top slot for final singles.
-        let t2 = pool.alloc(34).unwrap();
-        assert_eq!(t2, 26);
-        mark(&mut held, t2, 34, true);
-        assert_eq!(pool.alloc(2), None, "only two isolated 1-slot holes remain");
-
-        // Re-claiming the released top slot plus the 1-slot boundary fills every slot.
-        let s3 = pool.alloc(1).unwrap();
-        let s4 = pool.alloc(1).unwrap();
-        assert_eq!(s3, cap - 4);
-        assert_eq!(s4, cap - 1);
-        mark(&mut held, s3, 1, true);
-        mark(&mut held, s4, 1, true);
-        assert_eq!(free_space(&held), (0, 0));
-        assert_eq!(pool.alloc(1), None);
-        assert_eq!(pool.alloc(2), None);
-
-        // Releasing a multi-slot range and a single slot restores both allocation paths.
-        pool.release(t1 as u32, 13);
-        mark(&mut held, t1, 13, false);
-        pool.release(s2 as u32, 1);
-        mark(&mut held, s2, 1, false);
-        assert_eq!(pool.alloc(1), Some(s2));
-        mark(&mut held, s2, 1, true);
-        assert_eq!(pool.alloc(13), Some(t1));
-        mark(&mut held, t1, 13, true);
-        assert_eq!(free_space(&held), (0, 0));
-        assert_eq!(pool.taken, held);
-    }
-
-    #[test]
-    fn a_free_table_can_straddle_the_search_cursor() {
-        let Some(heap) = HostHeap::new(false, 4) else {
-            return;
-        };
-        let cap = heap.dynamic;
-        let left = heap.dynamic(4).unwrap();
-        let right = heap.dynamic(5).unwrap();
-        let tail = heap.dynamic(cap - 9).unwrap();
-
-        heap.release(left, 4);
-        assert_eq!(heap.dynamic(4), Some(left));
-        heap.release(right, 5);
-        heap.release(left, 4);
-        assert_eq!(heap.dynamic(9), Some(left));
-        assert_eq!(heap.dynamic(1), None, "the tail is still held");
-
-        heap.release(tail, cap - 9);
-        assert_eq!(heap.dynamic(cap - 9), Some(tail));
-    }
-
-    #[test]
-    fn single_slot_allocations_do_not_fragment_multi_slot_tables() {
-        let Some(heap) = HostHeap::new(false, 4) else {
-            return;
-        };
-        let cap = heap.dynamic;
-        let single_a = heap.dynamic(1).unwrap();
-        let single_b = heap.dynamic(1).unwrap();
-        assert_eq!(single_a, heap.count + cap - 1);
-        assert_eq!(single_b, heap.count + cap - 2);
-
-        let table_a = heap.dynamic(13).unwrap();
-        let table_b = heap.dynamic(13).unwrap();
-        assert_eq!(table_a, heap.count);
-        assert_eq!(table_b, heap.count + 13);
-
-        // Interleaved 1-slot churn stays at the top and leaves contiguous
-        // multi-slot room at the bottom of the dynamic pool.
-        let mut singles = vec![single_a, single_b];
-        let mut tables = vec![table_a, table_b];
-        for i in 0..32 {
-            singles.push(heap.dynamic(1).unwrap());
-            if i % 4 == 0 {
-                tables.push(heap.dynamic(13).unwrap());
-            }
-        }
-        for (i, slot) in singles.iter().enumerate() {
-            if i % 2 == 0 {
-                heap.release(*slot, 1);
-            }
-        }
-        let big = cap / 2;
-        let contig = heap.dynamic(big);
-        assert!(contig.is_some(), "single-slot holes blocked multi-slot allocation");
-        if let Some(first) = contig {
-            heap.release(first, big);
-        }
-        for (i, slot) in singles.into_iter().enumerate() {
-            if i % 2 != 0 {
-                heap.release(slot, 1);
-            }
-        }
-        for slot in tables {
-            heap.release(slot, 13);
-        }
-    }
-
-    #[test]
-    fn capped_view_heap_uses_128k_min_dynamic() {
-        const {
-            assert!(MIN_DYNAMIC == 1 << 17);
-            assert!(MIN_DYNAMIC < PORTABLE_VIEWS);
-        }
-        let Some(heap) = HostHeap::new(false, PORTABLE_VIEWS + 1) else {
-            return;
-        };
-        assert!(
-            heap.dynamic == DYNAMIC
-                || (heap.dynamic == MIN_DYNAMIC && heap.count == PORTABLE_VIEWS - MIN_DYNAMIC)
-        );
     }
 }

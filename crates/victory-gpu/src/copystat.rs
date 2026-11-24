@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// Counters since the last line.
-pub enum C {
+pub(crate) enum C {
     Submissions,
     Copies,
     CopyBytes,
@@ -131,7 +131,7 @@ pub enum C {
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
-pub fn add(c: C, n: u64) {
+pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
 }
 
@@ -1026,33 +1026,16 @@ pub(crate) fn presented() {
 
 fn page_faults() -> u64 {
     use windows_sys::Win32::System::ProcessStatus::{
-        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-
-    let mut counters = PROCESS_MEMORY_COUNTERS_EX {
-        cb: size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+    let mut c = PROCESS_MEMORY_COUNTERS {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
         ..Default::default()
     };
-    // The Win32 API accepts the base structure pointer, but uses cb to read
-    // the extended structure and fill PrivateUsage as well.
-    // SAFETY: our own process and a correctly sized extended structure.
-    let ok = unsafe {
-        K32GetProcessMemoryInfo(
-            GetCurrentProcess(),
-            (&mut counters as *mut PROCESS_MEMORY_COUNTERS_EX).cast::<PROCESS_MEMORY_COUNTERS>(),
-            counters.cb,
-        )
-    };
-    if ok == 0 {
-        return None;
-    }
-
-    Some(ProcessMemory {
-        page_faults: u64::from(counters.PageFaultCount),
-        private_usage: counters.PrivateUsage as u64,
-        working_set: counters.WorkingSetSize as u64,
-    })
+    // SAFETY: our own process and a sized structure.
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    u64::from(c.PageFaultCount)
 }
 
 /// Logs the counters per frame, and the ranges that took most bytes. The
@@ -1064,13 +1047,8 @@ pub(crate) fn log(frames: f64) {
     let counted = COUNT[C::Frames as usize].swap(0, Relaxed);
     let frames = if counted > 0 { counted as f64 } else { frames };
     static FAULTS: AtomicU64 = AtomicU64::new(0);
-    let memory = process_memory();
-    // Keep the previous successful sample when the OS query fails; otherwise
-    // the next successful read would count all lifetime faults as one interval.
-    let faults = memory.map_or(0, |m| {
-        let previous = FAULTS.swap(m.page_faults, Relaxed);
-        m.page_faults.saturating_sub(previous)
-    });
+    let faults = page_faults();
+    let faults = faults - FAULTS.swap(faults, Relaxed).min(faults);
     let c: Vec<f64> = COUNT
         .iter()
         .map(|a| a.swap(0, Relaxed) as f64 / frames)
@@ -1082,8 +1060,7 @@ pub(crate) fn log(frames: f64) {
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
          unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
-         changed, {:.1} MB hashed, {:.1} MB of them changed; \
-         {:.1} page scatters {:.0} pages in {:.1} map calls",
+         changed, {:.1} MB hashed, {:.1} MB of them changed",
         c[C::Submissions as usize],
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
@@ -1107,9 +1084,6 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
-        c[C::Scatter as usize],
-        c[C::ScatterPages as usize],
-        c[C::ScatterMaps as usize],
     );
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \

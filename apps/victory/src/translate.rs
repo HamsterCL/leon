@@ -7,18 +7,15 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
-#[cfg(windows)]
 use victory_shader::emit::host::{self, Host};
-#[cfg(windows)]
-use victory_shader::emit::validator::Validator;
-use victory_shader::emit;
+use victory_shader::emit::{self, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
     Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
 };
 use victory_shader::{io, resource};
 
-use crate::shader::{MAX_FILE, Source, scan_entries, sources};
+use crate::shader::{MAX_FILE, Source, sources};
 
 #[derive(Default)]
 struct Tally {
@@ -72,28 +69,25 @@ struct Tally {
     ms_emitted: usize,
     ms_validated: usize,
     ms_pipelines: usize,
-    /// Reason → programs stopped by it, and the smallest recorded label.
+    /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
-    /// With `--list`: per-program result rows, including runtime hashes.
+    /// With `--list`: one line per program and outcome.
     list: bool,
     lines: Vec<String>,
 }
 
 impl Tally {
     fn fail(&mut self, reason: String, example: impl FnOnce() -> String) {
-        let example = example();
         if self.list {
-            self.lines.push(format!("{example}  {reason}"));
+            let e = example();
+            self.lines.push(format!("{e}  {reason}"));
+            self.failed.entry(reason).or_insert((0, e)).0 += 1;
+            return;
         }
-        self.record_failure(reason, 1, example);
-    }
-
-    fn record_failure(&mut self, reason: String, n: usize, example: String) {
-        let (count, sample) = self.failed.entry(reason).or_default();
-        if *count == 0 || example < *sample {
-            *sample = example;
-        }
-        *count += n;
+        self.failed
+            .entry(reason)
+            .or_insert_with(|| (0, example()))
+            .0 += 1;
     }
 
     fn merge(&mut self, other: Tally) {
@@ -141,7 +135,7 @@ impl Tally {
         }
         self.lines.extend(other.lines);
         for (reason, (n, example)) in other.failed {
-            self.record_failure(reason, n, example);
+            self.failed.entry(reason).or_insert((0, example)).0 += n;
         }
     }
 }
@@ -154,9 +148,7 @@ struct Checks {
     /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
     /// kept to build those pipelines after the walk.
     keep: Option<Kept>,
-    #[cfg(windows)]
     validator: Option<Validator>,
-    #[cfg(windows)]
     host: Option<(Host, emit::HostShader)>,
 }
 
@@ -167,18 +159,6 @@ pub fn run(
     list: bool,
     jobs: Option<usize>,
 ) -> Result<()> {
-    let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
-        .unwrap_or_default()
-        .split(',')
-        .filter_map(|p| p.split_once('+'))
-        .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
-        .collect();
-    #[cfg(not(windows))]
-    if validate || pipelines || !pairs.is_empty() {
-        // Reject before reading config, so a fresh checkout sees the
-        // platform error rather than a missing path.
-        anyhow::bail!("--validate, --pipelines and VICTORY_PAIRS require Windows");
-    }
     let paths = crate::default_paths(paths)?;
     // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
     // at most 32 lanes (as the runtime does on such a card).
@@ -186,7 +166,6 @@ pub fn run(
         victory_shader::emit::set_host_max_wave(n);
     }
     let dll = validate.then(Validator::default_path).flatten();
-    #[cfg(windows)]
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
         println!(
@@ -195,18 +174,25 @@ pub fn run(
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
     }
-    #[cfg(windows)]
     if pipelines {
         Host::new(false).map_err(anyhow::Error::msg)?;
     }
+    let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|p| p.split_once('+'))
+        .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
+        .collect();
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
-    let mut walk_errors = 0;
     for root in &paths {
-        for entry in scan_entries(root, &mut walk_errors) {
+        for entry in walkdir::WalkDir::new(root)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
                 continue;
             }
@@ -224,11 +210,9 @@ pub fn run(
                         };
                         let mut checks = Checks {
                             keep: (!pairs.is_empty()).then(|| kept.clone()),
-                            #[cfg(windows)]
                             validator: validate
                                 .then(|| Validator::load(dll.as_deref()).ok())
                                 .flatten(),
-                            #[cfg(windows)]
                             host: pipelines
                                 .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
                                 .flatten(),
@@ -291,7 +275,6 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
-    #[cfg(windows)]
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -320,10 +303,6 @@ pub fn run(
     for (reason, (n, example)) in failed {
         println!("  {n:>7}  {reason}  (e.g. {example})");
     }
-    anyhow::ensure!(
-        walk_errors == 0,
-        "scan incomplete (traversal errors: {walk_errors})"
-    );
     Ok(())
 }
 
@@ -334,18 +313,9 @@ fn translate(
     t: &mut Tally,
     checks: &mut Checks,
 ) {
-    let location = || format!("{}{}", path.display(), source.label());
+    let example = || format!("{}{}", path.display(), source.label());
     let Some(bytes) = source.bytes() else {
-        return t.fail("corrupt record".into(), location);
-    };
-    let list = t.list;
-    let hash = list.then(|| blake3::hash(&bytes).to_hex().to_string());
-    let example = || {
-        let location = location();
-        match &hash {
-            Some(hash) => format!("{location} hash={}", &hash[..16]),
-            None => location,
-        }
+        return t.fail("corrupt record".into(), example);
     };
     // The hash a run's log names the shader by (`hash=` in "first bind",
     // "shader does not translate", "host pipeline refused").
@@ -558,7 +528,6 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
 }
 
 /// Validates an emitted shader if asked to.
-#[cfg_attr(not(windows), allow(unused_mut))]
 fn check(
     mut shader: emit::HostShader,
     t: &mut Tally,
@@ -581,7 +550,6 @@ fn check(
             &shader.dxil,
         );
     }
-    #[cfg(windows)]
     if let Some((h, stub_ps)) = &checks.host {
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
@@ -599,14 +567,9 @@ fn check(
             Err(e) => t.fail(format!("pipeline: {e}"), &label),
         }
     }
-    #[cfg(windows)]
     let Some(v) = checks.validator.as_mut() else {
-        if t.list && checks.host.is_none() {
-            t.lines.push(format!("{}  emitted", label()));
-        }
         return;
     };
-    #[cfg(windows)]
     match v.validate(&mut shader.dxil) {
         Ok(()) => {
             *counter(t, shader.stage, 2) += 1;
@@ -819,38 +782,4 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::Tally;
-
-    #[test]
-    fn failure_example_is_independent_of_worker_order() {
-        for list in [false, true] {
-            for reverse in [false, true] {
-                let mut first = Tally {
-                    list,
-                    ..Tally::default()
-                };
-                first.fail("reason".into(), || "z@0x0".into());
-                first.fail("reason".into(), || "a@0x0".into());
-                let mut second = Tally {
-                    list,
-                    ..Tally::default()
-                };
-                second.fail("reason".into(), || "m@0x0".into());
-                let mut total = Tally::default();
-                if reverse {
-                    std::mem::swap(&mut first, &mut second);
-                }
-                total.merge(first);
-                total.merge(second);
-                let (count, example) = &total.failed["reason"];
-                assert_eq!(*count, 3);
-                assert_eq!(example, "a@0x0");
-                assert_eq!(total.lines.len(), if list { 3 } else { 0 });
-            }
-        }
-    }
 }

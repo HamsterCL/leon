@@ -15,7 +15,6 @@
 //! (directly indexed views are not known per draw); plane 0 is uploaded
 //! (every mip and array slice), depth and stencil planes are not.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -36,6 +35,7 @@ macro_rules! once {
 pub(crate) struct Staging {
     buffer: ID3D12Resource,
     /// Its bytes.
+    #[cfg(feature = "diagnostics")]
     size: u64,
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
@@ -67,11 +67,6 @@ struct Last {
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
 }
-
-/// Room to read a watched texture's memory into, shared by all textures (a
-/// buffer each would hold the sum of their sizes for good). Kept, already
-/// touched, so refreshing does not fault its pages in again.
-static SCRATCH: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
@@ -541,7 +536,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             let f = footprint.Footprint;
             // SAFETY: live resources.
             let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
-            let len = footprint_len(footprint, staging.rows[i], staging.size);
+            let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
             list.note_read(
                 || {
                     format!(
@@ -596,17 +591,6 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     list.defer_texture(staging);
 }
 
-/// GetCopyableFootprints may end the buffer at the last row's active bytes.
-fn footprint_len(
-    footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
-    rows: u32,
-    buffer_size: u64,
-) -> u64 {
-    let f = footprint.Footprint;
-    let pitched = u64::from(f.RowPitch) * u64::from(rows) * u64::from(f.Depth);
-    pitched.min(buffer_size - footprint.Offset)
-}
-
 impl Staging {
     /// The title memory the texture is read from: address and bytes.
     pub(crate) fn memory(&self) -> (usize, usize) {
@@ -622,7 +606,6 @@ impl Staging {
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
-        victory_profile::record!("gpu", "texture refresh", read, started.elapsed());
     }
 
     /// Returns the bytes of title memory read.
@@ -640,10 +623,8 @@ impl Staging {
         let last = &mut *last;
         if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
-                victory_profile::cache!("gpu", "detiled textures", Hit);
                 return 0;
             }
-            victory_profile::cache!("gpu", "detiled textures", Miss);
             last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
@@ -751,10 +732,8 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
-            victory_profile::cache!("gpu", "detiled textures", Hit);
             return size;
         }
-        victory_profile::cache!("gpu", "detiled textures", Miss);
         last.hash = Some(hash);
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
@@ -806,7 +785,7 @@ impl Staging {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let len = footprint_len(footprint, rows, self.size) as usize;
+            let len = pitch * rows as usize * f.Depth as usize;
             // SAFETY: the subresource's part of the mapped staging buffer.
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
@@ -1058,6 +1037,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     let s = Arc::new(Staging {
         buffer,
+        #[cfg(feature = "diagnostics")]
         size: total,
         data,
         footprints,

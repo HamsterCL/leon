@@ -585,7 +585,7 @@ pub(crate) fn family(format: u32) -> u32 {
         (44, 47),
         (48, 52),
         (53, 59),
-        (60, 64),
+        (60, 65),
         (70, 72),
         (73, 75),
         (76, 78),
@@ -606,22 +606,12 @@ pub(crate) fn family(format: u32) -> u32 {
     }
 }
 
-/// sRGB formats and their linear twins: 8-bit color, then BC1, BC2, BC3
-/// and BC7.
-pub(crate) const SRGB: [(u32, u32); 7] = [
-    (29, 28),
-    (91, 87),
-    (93, 88),
-    (72, 71),
-    (75, 74),
-    (78, 77),
-    (99, 98),
-];
+/// sRGB formats and their linear twins.
+pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
-#[cfg(windows)]
 pub(crate) fn view_format(this: This) -> Option<u32> {
     // First: a view of no resource (a typed null view) has none.
     let host = host_resource(this)?;
@@ -661,34 +651,20 @@ fn mip_count(desc: &ResourceDesc) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlacedFootprint {
     pub(crate) offset: u64,
-    pub(crate) format: u32,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) depth: u32,
-    pub(crate) row_pitch: u32,
+    format: u32,
+    width: u32,
+    height: u32,
+    depth: u32,
+    row_pitch: u32,
 }
 
 impl PlacedFootprint {
-    /// `(lines, row_bytes, total_bytes)` spanned in a buffer: every row
-    /// pitched but the last.
-    pub(crate) fn layout(&self) -> Option<(u64, u64, u64)> {
-        let (element, block) = element(self.format)?;
-        let lines = u64::from(self.height)
-            .div_ceil(block)
-            .checked_mul(u64::from(self.depth))?;
-        let row_bytes = u64::from(self.width).div_ceil(block).checked_mul(element)?;
-        if lines == 0 {
-            return Some((0, row_bytes, 0));
-        }
-        let total = u64::from(self.row_pitch)
-            .checked_mul(lines - 1)?
-            .checked_add(row_bytes)?;
-        Some((lines, row_bytes, total))
-    }
-
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
-        self.layout().map(|(_, _, total)| total)
+        let (element, block) = element(self.format)?;
+        let lines = u64::from(self.height).div_ceil(block) * u64::from(self.depth);
+        let last = u64::from(self.width).div_ceil(block) * element;
+        Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
     }
 
     /// For a read back through a host buffer: this footprint at offset 0
@@ -996,7 +972,6 @@ impl Memory {
             NonNull::new(alloc(layout.size(), attributes).cast::<u8>()).ok_or(E_OUTOFMEMORY)?;
         // SAFETY: the allocator handed out `size` bytes.
         unsafe { ptr.as_ptr().write_bytes(0, layout.size()) };
-        victory_profile::resident!("gpu", "memory", layout.size());
         Ok(Memory {
             ptr,
             layout,
@@ -1038,7 +1013,6 @@ impl Memory {
 
 impl Drop for Memory {
     fn drop(&mut self) {
-        victory_profile::resident!("gpu", "memory", -(self.layout.size() as i64));
         match (self.attributes, ALLOCATOR.get()) {
             (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
             // SAFETY: allocated in `new` with this layout.
@@ -1686,22 +1660,9 @@ fn host_texture(
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
-    // NVIDIA GPUs reject packed 16-bit color formats (B5G5R5A1_UNORM = 86,
-    // B4G4R4A4_UNORM = 115) with RENDER_TARGET or UNORDERED_ACCESS, which
-    // turns every view into a null descriptor. Store them as R16_TYPELESS
-    // (same 16 bpp) so the host texture exists.
-    const R16_TYPELESS: u32 = 53;
-    const R16_UNORM: u32 = 56;
-    let packed16_fallback =
-        matches!(d.format, 86 | 115) && d.flags & (RENDER_TARGET | UNORDERED) != 0;
-    if packed16_fallback {
-        d.format = R16_TYPELESS;
-    }
     // The clear value names the format too: format, then color or depth
-    // and stencil (5 words). D3D12 rejects a non-null clear value if the
-    // resource does not have ALLOW_RENDER_TARGET or ALLOW_DEPTH_STENCIL, so
-    // null it out when we stripped RENDER_TARGET above.
-    let clear_value = (!clear.is_null() && !strip_rtv).then(|| {
+    // and stencil (5 words).
+    let clear_value = (!clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
@@ -1715,59 +1676,27 @@ fn host_texture(
         ..Default::default()
     };
     let mut texture: Option<ID3D12Resource> = None;
-    let create = |d: &ResourceDesc, texture: &mut Option<ID3D12Resource>| {
-        // A clear value is only legal on render targets and depth.
-        let clear = clear_value
-            .as_ref()
-            .filter(|_| d.flags & (1 | DEPTH) != 0)
-            .map(|v| std::ptr::from_ref(v).cast());
-        // SAFETY: the description has the host layout (checked size, same
-        // fields); the out pointer is ours.
-        unsafe {
-            host.device.CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                std::ptr::from_ref(d).cast(),
-                D3D12_RESOURCE_STATES(crate::host::legal_for(
-                    d.flags,
-                    crate::host::texture_state(state),
-                ) as i32),
-                // The same layout: format, then color or depth and stencil.
-                clear,
-                texture,
-            )
-        }
+    // SAFETY: the description has the host layout (checked size, same
+    // fields); the out pointer is ours.
+    let made = unsafe {
+        host.device.CreateCommittedResource(
+            &heap,
+            D3D12_HEAP_FLAG_NONE,
+            (&raw const d).cast(),
+            D3D12_RESOURCE_STATES(
+                crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
+            ),
+            // The same layout: format, then color or depth and stencil.
+            clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
+            &mut texture,
+        )
     };
-    let mut made = create(&d, &mut texture);
-    // Not every host GPU offers every use of every format (NVIDIA: no
-    // unordered access to BGRA8, no B4G4R4A4 render targets, where the
-    // console's AMD GPU has both). Give up the uses the host refuses, UAV
-    // first; the views the host cannot make are skipped as for depth.
-    for drop in [UNORDERED, 1] {
-        if made.is_ok() || d.flags & drop == 0 {
-            continue;
-        }
-        let mut fewer = d;
-        fewer.flags &= !drop;
-        let mut retry: Option<ID3D12Resource> = None;
-        if create(&fewer, &mut retry).is_ok() {
-            tracing::warn!(desc = ?d, dropped = drop, "host texture without a use the host refuses");
-            d = fewer;
-            texture = retry;
-            made = Ok(());
-        } else if drop == UNORDERED {
-            d = fewer; // also try with neither
-        }
-    }
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no host texture");
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {
-            format!(
-                "texture {}x{} f{} flags {:#x}",
-                d.width, d.height, d.format, d.flags
-            )
+            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
         });
     }
     texture
@@ -2206,15 +2135,9 @@ extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *m
 }
 extern "system" fn unmap(_: This, _sub: u32, _written: *const c_void) {}
 extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) {
-    if let Some(out) = unsafe { out.as_mut() } {
-        let mut desc = resource(this).desc;
-        // Native D3D12 reports the levels it actually allocated for an
-        // automatically sized chain; keep the title's explicit value
-        // otherwise.
-        if desc.mip_levels == 0 {
-            desc.mip_levels = mip_count(&desc) as u16;
-        }
-        *out = desc;
+    if !out.is_null() {
+        // SAFETY: checked non-null; the title passes room for a description.
+        unsafe { out.write(resource(this).desc) };
     }
 }
 /// Device method `GetCustomHeapProperties`, returning its struct through a
@@ -2315,62 +2238,9 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 };
 
 #[cfg(test)]
-pub(crate) fn test_buffer(width: u64) -> This {
-    let heap = HeapProperties {
-        kind: 1,
-        cpu_pages: 0,
-        pool: 0,
-        creation_nodes: 0,
-        visible_nodes: 0,
-    };
-    let desc = ResourceDesc {
-        dimension: BUFFER,
-        alignment: 0,
-        width,
-        height: 1,
-        depth_or_array_size: 1,
-        mip_levels: 1,
-        format: 0,
-        sample_count: 1,
-        sample_quality: 0,
-        layout: 1,
-        flags: 0,
-    };
-    let mut out = std::ptr::null();
-    let hr = create_committed(
-        std::ptr::null(),
-        &heap,
-        0,
-        &desc,
-        0,
-        std::ptr::null(),
-        &RESOURCE_IIDS[0],
-        &mut out,
-    );
-    assert_eq!(hr, S_OK);
-    out
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::object::slot;
-
-    #[test]
-    fn a8_unorm_is_not_in_the_r8_typeless_family() {
-        // DXGI_FORMAT values: 60 R8_TYPELESS, 61 R8_UNORM, 62 R8_UINT,
-        // 63 R8_SNORM, 64 R8_SINT, 65 A8_UNORM. The R8 typeless family is
-        // 60..=64; A8_UNORM has no typeless family and cannot be cast to R8,
-        // so it must stand alone rather than fold into R8_TYPELESS.
-        assert_eq!(family(60), 60);
-        for f in 61..=64 {
-            assert_eq!(family(f), 60);
-        }
-        assert_eq!(family(65), 65);
-        // Boundaries: 59 belongs to the preceding family, 66 is unmapped.
-        assert_eq!(family(59), 53);
-        assert_eq!(family(66), 66);
-    }
 
     type Release = extern "system" fn(This) -> u32;
     type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;
@@ -2578,12 +2448,6 @@ mod tests {
         assert_eq!(info.size, u64::MAX);
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn a_missing_resource_has_no_default_view_format() {
-        assert_eq!(view_format(std::ptr::null()), None);
-    }
-
     #[test]
     fn upload_footprints_follow_the_pc_rules() {
         let null = std::ptr::null();
@@ -2607,209 +2471,6 @@ mod tests {
         assert_eq!((r[0], s[0]), (16, 128));
         let (_, _, _, t) = footprints(&texture(64, 64, 71, 1), 1, 1);
         assert_eq!(t, u64::MAX, "no second subresource");
-    }
-
-    /// The title may view a texture as sRGB or linear whichever format it
-    /// made it in, as the console allows: a shader reads 0x80 as 0.216
-    /// through the sRGB view, 0.502 through the linear one, and in the
-    /// texture's own format through a view without a description.
-    #[cfg(windows)]
-    #[test]
-    fn srgb_and_linear_views_of_one_texture_read_their_own_curve() {
-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-        use windows::Win32::Graphics::Direct3D::ID3DBlob;
-        use windows::Win32::Graphics::Direct3D12::*;
-        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
-        use windows::core::s;
-        let Some(host) = crate::host::host() else {
-            return; // no host GPU here
-        };
-        const SOURCE: &str = r#"
-#define RS "DescriptorTable(SRV(t0, numDescriptors=3)), UAV(u0)"
-Texture2D<float4> as_srgb : register(t0);
-Texture2D<float4> as_linear : register(t1);
-Texture2D<float4> as_own : register(t2);
-RWByteAddressBuffer reads : register(u0);
-[RootSignature(RS)]
-[numthreads(1, 1, 1)]
-void main() {
-    int3 at = int3(1, 2, 0);
-    float3 r = float3(as_srgb.Load(at).r, as_linear.Load(at).r, as_own.Load(at).r);
-    reads.Store3(0, asuint(r));
-}
-"#;
-        let mut blob: Option<ID3DBlob> = None;
-        // SAFETY: the source and names live through the call; the out
-        // pointer is ours.
-        unsafe {
-            D3DCompile(
-                SOURCE.as_ptr().cast(),
-                SOURCE.len(),
-                s!("views"),
-                None,
-                None,
-                s!("main"),
-                s!("cs_5_1"),
-                0,
-                0,
-                &mut blob,
-                None,
-            )
-            .unwrap()
-        };
-        let blob = blob.unwrap();
-        // SAFETY: the blob's own bytes.
-        let code = unsafe {
-            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
-        };
-        // SAFETY: plain object creation; the root signature is inside the
-        // shader.
-        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
-            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, code).unwrap();
-            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: std::mem::transmute_copy(&root),
-                CS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: code.as_ptr().cast(),
-                    BytecodeLength: code.len(),
-                },
-                ..Default::default()
-            };
-            let pso = host.device.CreateComputePipelineState(&desc).unwrap();
-            (root, pso)
-        };
-        let host_buffer = |kind: D3D12_HEAP_TYPE, flags, state| {
-            let mut b: Option<ID3D12Resource> = None;
-            let desc = D3D12_RESOURCE_DESC {
-                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                Width: 256,
-                Height: 1,
-                DepthOrArraySize: 1,
-                MipLevels: 1,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                Flags: flags,
-                ..Default::default()
-            };
-            let heap = D3D12_HEAP_PROPERTIES {
-                Type: kind,
-                ..Default::default()
-            };
-            // SAFETY: plain creation of a buffer.
-            unsafe {
-                host.device
-                    .CreateCommittedResource(
-                        &heap,
-                        D3D12_HEAP_FLAG_NONE,
-                        &desc,
-                        state,
-                        None,
-                        &mut b,
-                    )
-                    .unwrap()
-            };
-            b.unwrap()
-        };
-        // The texture made in `own`, its memory filled with `block`: what
-        // the shader reads through the title's views in `views` (sRGB,
-        // linear) and through one without a description.
-        let read = |own: u32, views: [u32; 2], block: &[u8]| -> [f32; 3] {
-            let null = std::ptr::null();
-            let mut image = null;
-            let desc = texture(4, 4, own, 1);
-            let iid = &RESOURCE_IIDS[0];
-            assert_eq!(
-                create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), iid, &mut image),
-                S_OK
-            );
-            // Every element alike, so the layout does not matter.
-            let size = footprint(&desc).unwrap().size as usize;
-            // SAFETY: the texture's memory, `size` bytes.
-            let memory = unsafe { std::slice::from_raw_parts_mut(resource(image).data(), size) };
-            for (i, b) in memory.iter_mut().enumerate() {
-                *b = block[i % block.len()];
-            }
-            let mut slots = [0u64; 3 * 4];
-            let base = slots.as_mut_ptr() as u64;
-            let at = |i: u32| base + 32 * u64::from(i);
-            // 2D, the default component mapping, one mip.
-            let mapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            let srv = |format| [format, 4, mapping, 0, 0, 1, 0, 0, 0, 0];
-            crate::descriptor::create_srv(null, image, &srv(views[0]), at(0));
-            crate::descriptor::create_srv(null, image, &srv(views[1]), at(1));
-            crate::descriptor::create_srv(null, image, null.cast(), at(2));
-            let heap = crate::descriptor::host::HostHeap::new(false, 3).unwrap();
-            for i in 0..3 {
-                assert!(heap.mirror(i, at(i), true).is_some());
-            }
-            let out = host_buffer(
-                D3D12_HEAP_TYPE_DEFAULT,
-                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_COMMON,
-            );
-            let back = host_buffer(
-                D3D12_HEAP_TYPE_READBACK,
-                D3D12_RESOURCE_FLAG_NONE,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-            );
-            let list = host.new_list().unwrap();
-            crate::texture::upload(&list, image, host_resource(image).unwrap());
-            const NON_PIXEL_SHADER_RESOURCE: u32 = 0x40;
-            crate::list::ensure_state(&list, image, NON_PIXEL_SHADER_RESOURCE);
-            // SAFETY: an open list; our pipeline, heap and live resources.
-            unsafe {
-                let l = &list.list;
-                l.SetComputeRootSignature(&root);
-                l.SetPipelineState(&pso);
-                l.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
-                l.SetComputeRootDescriptorTable(0, heap.heap.GetGPUDescriptorHandleForHeapStart());
-                l.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
-                l.Dispatch(1, 1, 1);
-                l.ResourceBarrier(&[crate::host::transition(
-                    &out,
-                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                )]);
-                l.CopyBufferRegion(&back, 0, &out, 0, 12);
-            }
-            list.close();
-            host.execute(&[&list]);
-            let mut mapped = std::ptr::null_mut();
-            // SAFETY: the copy finished (execute waits); it wrote 12 bytes.
-            let read = unsafe {
-                let range = D3D12_RANGE { Begin: 0, End: 12 };
-                back.Map(0, Some(&range), Some(&mut mapped)).unwrap();
-                mapped.cast::<[f32; 3]>().read_unaligned()
-            };
-            assert_eq!(slot::<Release>(image, 0x10)(image), 0);
-            read
-        };
-        let to_linear = |c: f32| ((c + 0.055) / 1.055).powf(2.4);
-        // 0x80 in every channel of 8-bit color; a BC1 block of one color,
-        // red 16 of 31 (132 of 255 when expanded to 8 bits first).
-        const RGBA: &[u8] = &[0x80];
-        const BC1: &[u8] = &[0x00, 0x80, 0x00, 0x80, 0, 0, 0, 0];
-        let cases = [
-            (28, 29, 128.0 / 255.0, 0.002f32, RGBA),
-            (87, 91, 128.0 / 255.0, 0.002, RGBA),
-            (71, 72, 16.0 / 31.0, 0.01, BC1),
-        ];
-        let mut wrong = Vec::new();
-        for (linear, srgb, unorm, near, block) in cases {
-            for own in [linear, srgb] {
-                let curve = to_linear(unorm);
-                let wanted = [curve, unorm, if own == srgb { curve } else { unorm }];
-                let got = read(own, [srgb, linear], block);
-                if got.iter().zip(wanted).any(|(g, w)| (g - w).abs() > near) {
-                    wrong.push(format!(
-                        "texture {own}, views {srgb}/{linear}/none: read {got:?}, wanted {wanted:?}"
-                    ));
-                }
-            }
-        }
-        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// A 4x4 texture filled from a title buffer through our list and queue,
@@ -3745,46 +3406,5 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
-    }
-
-    #[test]
-    fn get_desc_reports_the_allocated_mip_chain() {
-        type Desc = extern "system" fn(This, *mut ResourceDesc);
-        let null = std::ptr::null();
-        let create = |desc: &ResourceDesc, out: &mut This| {
-            assert_eq!(
-                create_committed(
-                    null,
-                    &PROPERTIES,
-                    0,
-                    desc,
-                    0,
-                    null.cast(),
-                    &RESOURCE_IIDS[0],
-                    out,
-                ),
-                S_OK
-            );
-        };
-        let reported = |this: This| {
-            let mut desc = buffer(0);
-            slot::<Desc>(this, 0x50)(this, &mut desc);
-            desc.mip_levels
-        };
-
-        let mut automatic = null;
-        create(&texture(4, 4, 28, 0), &mut automatic);
-        assert_eq!(reported(automatic), 3, "4x4 has three levels");
-        assert_eq!(slot::<Release>(automatic, 0x10)(automatic), 0);
-
-        let mut explicit = null;
-        create(&texture(16, 16, 28, 2), &mut explicit);
-        assert_eq!(reported(explicit), 2, "explicit count is preserved");
-        assert_eq!(slot::<Release>(explicit, 0x10)(explicit), 0);
-
-        let mut buf = null;
-        create(&buffer(256), &mut buf);
-        assert_eq!(reported(buf), 1, "buffers have one level");
-        assert_eq!(slot::<Release>(buf, 0x10)(buf), 0);
     }
 }

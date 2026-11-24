@@ -11,7 +11,7 @@ use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
-use crate::{ShaderError, io, ir, resource, structure};
+use crate::{io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 
@@ -168,9 +168,10 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-    })?;
+    })
+    .expect("lower");
 
-    Ok(HostShader {
+    let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
@@ -181,7 +182,15 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
     };
-    assert!(e.to_string().contains("no instruction writes"), "{e}");
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy).expect("DXIL validation failed");
+        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    }
+
+    shader
 }
 
 /// One GPU test at a time. With these tests on the hardware adapter and WARP
@@ -191,24 +200,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
 /// modules take this lock too.
 pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// `Host::new(false)` also selects WARP when the environment forces it.
-/// Do not run that backend twice or label software results as hardware.
-pub(super) fn backends(force_warp: bool) -> &'static [(&'static str, bool)] {
-    if force_warp {
-        &[("warp", true)]
-    } else {
-        &[("hardware", false), ("warp", true)]
-    }
-}
-
-#[test]
-fn forced_warp_runs_only_the_software_backend() {
-    assert_eq!(backends(true), &[("warp", true)]);
-    assert_eq!(backends(false), &[("hardware", false), ("warp", true)]);
-}
-
-/// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP,
-/// or WARP alone with `VICTORY_WARP=1`) for
+/// Runs `shader` on every available SM 6.6 host (hardware GPU and WARP) for
 /// each 4-dword input set and invokes `check(backend, case_index, inputs, result_dword)`.
 fn run_cases(
     shader: &HostShader,
@@ -267,61 +259,8 @@ fn run_cases_on(
     assert!(ran > 0, "no SM 6.6 device available ({devices:?})");
 }
 
-#[test]
-fn scalar_quad_masks_pack_nibbles_and_set_scc() {
-    let pack_words = |opcode: u32| {
-        [
-            0xBE90_0000 | opcode << 8,   // s_quadmask s16, s0 (pairs for b64)
-            sop2(0x0a, 18, 129, 128),  // s_cselect_b32 s18, 1, 0
-            sop2(0x1e, 18, 18, 144),   // s_lshl_b32 s18, s18, 16
-            sop2(0x10, 16, 16, 18),    // s_or_b32 s16, s16, s18
-            vop1(1, 0, sgpr(16)),      // v_mov_b32 v0, s16
-        ]
-    };
-    let cases = [
-        ([0, 0, 0, 0], [0, 0]),
-        ([0x8000_0420, 0x0100_0001, 0, 0], [0x1_0086, 0x1_4186]),
-        ([0, 0x8000_0000, 0, 0], [0, 0x1_8000]),
-        ([u32::MAX, u32::MAX, 0, 0], [0x1_00ff, 0x1_ffff]),
-    ];
-    let inputs = cases.map(|(input, _)| input);
-    for (wide, opcode) in [0x2c, 0x2d].into_iter().enumerate() {
-        let shader = build_valu_cs(&pack_words(opcode));
-        run_cases(&shader, &inputs, |backend, i, _, got| {
-            assert_eq!(got, cases[i].1[wide], "{backend}, opcode {opcode:#x}");
-        });
-    }
-    let high = build_valu_cs(&[
-        0xBE90_2D00, // s_quadmask_b64 s[16:17], s[0:1]
-        vop1(1, 0, sgpr(17)),
-    ]);
-    run_cases(&high, &inputs, |backend, _, _, got| {
-        assert_eq!(got, 0, "{backend}: high dword");
-    });
-}
-
 fn is_f16_nan(bits: u16) -> bool {
     (bits & 0x7FFF) > 0x7C00
-}
-
-#[test]
-fn a_branch_to_fallthrough_keeps_both_values_at_a_join() {
-    let shader = build_valu_cs(&[
-        0xBF06_0100,            // s_cmp_eq_u32 s0, s1
-        0xBF85_0002,            // s_cbranch_scc1 -> the s2 = 1 path
-        s_mov_b32(2, 128),      // s2 = 0
-        0xBF82_0002,            // s_branch -> the join
-        s_mov_b32(2, 129),      // s2 = 1
-        0xBF85_0000,            // s_cbranch_scc1 -> the following instruction
-        vop1(0x001, 0, sgpr(2)), // join: v0 = s2
-    ]);
-    run_cases(
-        &shader,
-        &[[7, 7, 0, 0], [7, 5, 0, 0]],
-        |backend, _, inputs, actual| {
-            assert_eq!(actual, u32::from(inputs[0] == inputs[1]), "{backend}");
-        },
-    );
 }
 
 fn f16_to_f32(bits: u16) -> f32 {
@@ -348,78 +287,6 @@ fn f16_to_f32(bits: u16) -> f32 {
     f32::from_bits(f32_bits)
 }
 
-/// MTBUF `op vdata, off, s[srsrc:srsrc+3], 0 format:format` (at byte 0).
-const fn mtbuf(op: u8, vdata: u8, srsrc: u8, format: u8) -> [u32; 2] {
-    [
-        0x3A << 26 | (format as u32 & 0x7F) << 19 | (op as u32 & 7) << 16,
-        0x80 << 24
-            | (op as u32 >> 3 & 1) << 21
-            | (srsrc as u32 >> 2 & 0x1F) << 16
-            | (vdata as u32) << 8,
-    ]
-}
-
-/// Stores `v1` to the buffer, then reads it back into `v0` with the tbuffer
-/// load `op` in buffer format `format`.
-fn tbuffer_load_of_v1(op: u8, format: u8) -> HostShader {
-    let mut body = buffer_store_dword(1, 8, 0).to_vec();
-    body.extend(mtbuf(op, 0, 8, format));
-    build_valu_cs(&body)
-}
-
-#[test]
-fn tbuffer_d16_loads_pack_two_channels_per_dword() {
-    // tbuffer_load_format_d16_x and tbuffer_load_format_d16_xy.
-    let (x, xy) = (8, 9);
-    // (opcode, format, dword stored, dword loaded)
-    let cases: &[(u8, u8, u32, u32)] = &[
-        // 16_16_FLOAT: the f16 pair (1.0, 2.0) as it was stored.
-        (xy, 29, 0x4000_3C00, 0x4000_3C00),
-        // 16_16_UINT: the 16-bit integers as they were stored.
-        (xy, 27, 0xBEEF_1234, 0xBEEF_1234),
-        // 16_16_UNORM: 0.0 and 1.0, as f16.
-        (xy, 23, 0xFFFF_0000, 0x3C00_0000),
-        // 16_FLOAT, one channel: the high half is 0.
-        (x, 13, 0x4000_3C00, 0x0000_3C00),
-    ];
-    for &(op, format, stored, want) in cases {
-        let shader = tbuffer_load_of_v1(op, format);
-        run_cases(&shader, &[[stored, 0, 0, 0]], |backend, _, _, got| {
-            assert_eq!(
-                got, want,
-                "{backend}: d16 opcode {op} format {format} of {stored:#010x} = {got:#010x}, want {want:#010x}",
-            );
-        });
-    }
-}
-
-#[test]
-fn normalized_buffer_formats_load_their_ends_exactly() {
-    // tbuffer_load_format_x.
-    let x = 0;
-    // (format, dword stored, value loaded)
-    let cases: &[(u8, u32, f32)] = &[
-        (1, 0xFF, 1.0),   // 8_UNORM
-        (7, 0xFFFF, 1.0), // 16_UNORM
-        (2, 0x7F, 1.0),   // 8_SNORM: the top, the one above the lowest, the lowest
-        (2, 0x81, -1.0),
-        (2, 0x80, -1.0),
-        (8, 0x7FFF, 1.0), // 16_SNORM
-        (8, 0x8001, -1.0),
-        (8, 0x8000, -1.0),
-    ];
-    for &(format, stored, want) in cases {
-        let shader = tbuffer_load_of_v1(x, format);
-        run_cases(&shader, &[[stored, 0, 0, 0]], |backend, _, _, got| {
-            assert_eq!(
-                got,
-                want.to_bits(),
-                "{backend}: format {format} of {stored:#x} = {got:#010x}, want {want}",
-            );
-        });
-    }
-}
-
 #[test]
 fn packed_add_selects_halves_of_inline_constants() {
     // Add the inline constant 1/(2*pi) to v1 (zero) to read back its two halves.
@@ -439,87 +306,6 @@ fn packed_add_selects_halves_of_inline_constants() {
             assert_eq!(got, expected, "{backend}: {words:08x?}");
         });
     }
-}
-
-#[test]
-fn half_int_ops_decode_inline_float_constants_as_f32_bits() {
-    // Non-packed 16-bit integer ops read the f32 bits of inline float constants
-    // (240..=248), while 16-bit float ops read their f16 bits (matching RDNA2
-    // and the packed test above).
-    let vop3_opsel = |op: u16, dst: u8, s0: u16, s1: u16, opsel: u8| -> [u32; 2] {
-        let [w0, w1] = vop3(op, dst, s0, s1, 0);
-        [w0 | (u32::from(opsel) << 11), w1]
-    };
-    let with_zero_v0 = |inst: &[u32]| -> Vec<u32> {
-        let mut body = vec![vop1(0x001, 0, 0x80)]; // v_mov_b32 v0, 0
-        body.extend_from_slice(inst);
-        body
-    };
-
-    // Inline 248 = 1/(2*pi): f32 0x3e22_f983, f16 0x3118.
-    // Inline 242 = 1.0:      f32 0x3f80_0000, f16 0x3c00.
-    let cases: &[(&str, Vec<u32>, [u32; 4], u32)] = &[
-        (
-            "v_add_nc_u16 low half of inline 248",
-            with_zero_v0(&vop3_opsel(0x303, 0, 248, vgpr(1), 0)),
-            [0, 0, 0, 0],
-            0x0000_F983,
-        ),
-        (
-            "v_add_nc_u16 high half of inline 248",
-            with_zero_v0(&vop3_opsel(0x303, 0, 248, vgpr(1), 0b0001)),
-            [0, 0, 0, 0],
-            0x0000_3E22,
-        ),
-        (
-            "v_add_nc_u16 low half of inline 1.0",
-            with_zero_v0(&vop3_opsel(0x303, 0, 242, vgpr(1), 0)),
-            [5, 0, 0, 0],
-            0x0000_0005,
-        ),
-        (
-            "v_add_nc_u16 high half of inline 1.0",
-            with_zero_v0(&vop3_opsel(0x303, 0, 242, vgpr(1), 0b0001)),
-            [5, 0, 0, 0],
-            0x0000_3F85,
-        ),
-        (
-            "v_cvt_f16_u16 low half of inline 1.0",
-            with_zero_v0(&[vop1(0x050, 0, 242)]),
-            [0, 0, 0, 0],
-            0x0000_0000,
-        ),
-        (
-            "v_add_f16 control keeps f16 bits of inline 248",
-            with_zero_v0(&vop3_opsel(0x132, 0, 248, vgpr(1), 0)),
-            [0, 0, 0, 0],
-            0x0000_3118,
-        ),
-    ];
-
-    for (label, body, input, expected) in cases {
-        let shader = build_valu_cs(body);
-        run_cases(&shader, &[*input], |backend, _, _, got| {
-            assert_eq!(
-                got, *expected,
-                "{backend}: {label}: got {got:#010x}, want {expected:#010x}"
-            );
-        });
-    }
-
-    // v_cmp_eq_u16_e64 s6, 0x3e22f983 (inline 248), v1 -> select 1 if equal.
-    let mut cmp_body = vop3(0x0aa, 6, 248, vgpr(1), 0).to_vec();
-    cmp_body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(6)));
-    let cmp_shader = build_valu_cs(&cmp_body);
-    let cmp_cases = [([0xF983, 0, 0, 0], 1u32), ([0x3118, 0, 0, 0], 0u32)];
-    let cmp_inputs: Vec<[u32; 4]> = cmp_cases.iter().map(|c| c.0).collect();
-    run_cases(&cmp_shader, &cmp_inputs, |backend, i, inp, got| {
-        assert_eq!(
-            got, cmp_cases[i].1,
-            "{backend}: v_cmp_eq_u16(inline 248, {:#06x}) = {got}, want {}",
-            inp[0], cmp_cases[i].1
-        );
-    });
 }
 
 #[test]
@@ -592,77 +378,6 @@ fn max_and_min_order_negative_zero_below_positive_zero() {
         let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
         run_cases(&shader, &cases, |backend, _, inp, got| {
             assert_eq!(got, want, "{backend}: {name} {inp:x?}");
-        });
-    }
-}
-
-/// The f16 forms go through the same `max_min` helper, after widening to f32.
-#[test]
-fn f16_max_and_min_order_negative_zero_below_positive_zero() {
-    let (pz, nz) = (0_u32, 0x8000_u32);
-    let cases = [
-        [nz, pz, nz, 0],
-        [pz, nz, nz, 0],
-        [nz, pz, pz, 0],
-        [pz, nz, pz, 0],
-    ];
-    let ops = [
-        ("v_max_f16", 0x139, pz),
-        ("v_min_f16", 0x13A, nz),
-        ("v_max3_f16", 0x354, pz),
-        ("v_min3_f16", 0x351, nz),
-    ];
-    for (name, op, want) in ops {
-        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
-        run_cases(&shader, &cases, |backend, _, inp, got| {
-            // The f16 result is the low half of v0.
-            assert_eq!(got & 0xFFFF, want, "{backend}: {name} {inp:x?}");
-        });
-    }
-}
-
-#[test]
-fn v_min3_max3_med3_integer_forms_match_rdna2() {
-    // v_{min3,max3,med3}_{i32,u32} v0, v1, v2, v3 (VOP3 0x152..0x159).
-    type Pick = fn([u32; 3]) -> u32;
-    let ops: [(&str, u16, Pick); 6] = [
-        ("v_min3_i32", 0x152, |t| {
-            t.into_iter().min_by_key(|&x| x as i32).unwrap()
-        }),
-        ("v_min3_u32", 0x153, |t| t.into_iter().min().unwrap()),
-        ("v_max3_i32", 0x155, |t| {
-            t.into_iter().max_by_key(|&x| x as i32).unwrap()
-        }),
-        ("v_max3_u32", 0x156, |t| t.into_iter().max().unwrap()),
-        ("v_med3_i32", 0x158, |mut t| {
-            t.sort_by_key(|&x| x as i32);
-            t[1]
-        }),
-        ("v_med3_u32", 0x159, |mut t| {
-            t.sort_unstable();
-            t[1]
-        }),
-    ];
-    // Every ordering of three values, with the sign bit set on some so that
-    // the signed and unsigned answers differ.
-    let values = [0u32, 1, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFF];
-    let mut cases = Vec::new();
-    for a in values {
-        for b in values {
-            for c in values {
-                cases.push([a, b, c, 0]);
-            }
-        }
-    }
-    for (name, op, pick) in ops {
-        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
-        run_cases(&shader, &cases, |backend, _, inp, got| {
-            let want = pick([inp[0], inp[1], inp[2]]);
-            assert_eq!(
-                got, want,
-                "{backend}: {name}({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
-                inp[0], inp[1], inp[2],
-            );
         });
     }
 }
@@ -758,112 +473,6 @@ fn v_cmp_lg_is_false_for_nan() {
             );
         });
     }
-}
-
-/// `v_div_fixup_f16` as the RDNA2 ISA lists it; `None` for a NaN.
-fn div_fixup_f16_reference(q: u16, den: u16, num: u16) -> Option<u16> {
-    let nan = |x: u16| is_f16_nan(x);
-    let abs = |x: u16| x & 0x7FFF;
-    let sign = (den ^ num) & 0x8000;
-    if nan(num) || nan(den) {
-        return None;
-    }
-    if (abs(den) == 0 && abs(num) == 0) || (abs(den) == 0x7C00 && abs(num) == 0x7C00) {
-        return None;
-    }
-    if abs(den) == 0 || abs(num) == 0x7C00 {
-        return Some(sign | 0x7C00);
-    }
-    if abs(den) == 0x7C00 || abs(num) == 0 {
-        return Some(sign);
-    }
-    // An all-ones exponent overflows, so a NaN quotient gives infinity
-    // (gfx1036 hardware).
-    if abs(q) >= 0x7C00 {
-        return Some(sign | 0x7C00);
-    }
-    Some(sign | abs(q))
-}
-
-#[test]
-fn v_div_fixup_f16_follows_the_isa_special_cases() {
-    // v_mov_b32 v0, 0; v_div_fixup_f16 v0, v1, v2, v3 (VOP3 opcode 0x35f):
-    // v1 the quotient, v2 the denominator, v3 the numerator.
-    let mut body = vec![vop1(0x001, 0, 128)];
-    body.extend_from_slice(&vop3(0x35f, 0, vgpr(1), vgpr(2), vgpr(3)));
-    let shader = build_valu_cs(&body);
-    // 0, -0, 1, -1.5, 2^-24, max finite, inf, -inf, NaN, -NaN.
-    let values = [
-        0x0000u16, 0x8000, 0x3C00, 0xBE00, 0x0001, 0x7BFF, 0x7C00, 0xFC00, 0x7E00, 0xFE01,
-    ];
-    let mut cases = Vec::new();
-    for &q in &[0x4248u16, 0xC248, 0x7E00, 0x7C01] {
-        for &den in &values {
-            for &num in &values {
-                cases.push([u32::from(q), u32::from(den), u32::from(num), 0]);
-            }
-        }
-    }
-    run_cases(&shader, &cases, |backend, _, inp, got| {
-        let (q, den, num) = (inp[0] as u16, inp[1] as u16, inp[2] as u16);
-        let got_h = got as u16;
-        assert_eq!(got >> 16, 0, "{backend}: the high half changed");
-        match div_fixup_f16_reference(q, den, num) {
-            Some(want) => assert_eq!(
-                got_h, want,
-                "{backend}: v_div_fixup_f16({q:#06x}, {den:#06x}, {num:#06x}) = {got_h:#06x}, \
-                 want {want:#06x}",
-            ),
-            None => assert!(
-                is_f16_nan(got_h),
-                "{backend}: v_div_fixup_f16({q:#06x}, {den:#06x}, {num:#06x}) = {got_h:#06x}, \
-                 want NaN",
-            ),
-        }
-    });
-}
-
-#[test]
-fn v_fma_legacy_f32_follows_the_d3d9_zero_rule() {
-    // v_fma_legacy_f32 v0, v1, v2, v3 (VOP3 opcode 0x140 on RDNA2)
-    let shader = build_valu_cs(&vop3(0x140, 0, vgpr(1), vgpr(2), vgpr(3)));
-    let f = f32::to_bits;
-    let cases: &[([u32; 4], u32)] = &[
-        ([f(2.0), f(3.0), f(1.0), 0], f(7.0)),
-        // A zero factor gives a zero product, whatever the other one is.
-        ([0, f(f32::INFINITY), f(1.5), 0], f(1.5)),
-        ([f(f32::NAN), 0, f(-2.0), 0], f(-2.0)),
-    ];
-    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
-    run_cases(&shader, &inputs, |backend, i, _, got| {
-        let want = cases[i].1;
-        assert_eq!(got, want, "{backend}: case {i}: {got:#x}, want {want:#x}");
-    });
-}
-
-#[test]
-fn v_cvt_off_f32_i4_uses_the_signed_low_nibble() {
-    // v_cvt_off_f32_i4 v0, v1 (VOP1 opcode 0x00e)
-    let shader = build_valu_cs(&[vop1(0x00e, 0, vgpr(1))]);
-    let nibble = |n: u32| (((n as i32) << 28) >> 28) as f32 / 16.0;
-
-    let mut cases: Vec<u32> = (0..16).collect();
-    // Bits above the low nibble are ignored.
-    cases.extend([0xABCD_EF05, 0xFFFF_FFF8, 0x1234_5670, 0x8000_000F, 0x0000_00F7]);
-    let inputs: Vec<[u32; 4]> = cases.iter().map(|&x| [x, 0, 0, 0]).collect();
-    run_cases(&shader, &inputs, |backend, i, inp, got| {
-        let want = nibble(cases[i]).to_bits();
-        assert_eq!(
-            got, want,
-            "{backend}: v_cvt_off_f32_i4({:#010x}) = {got:#010x} ({:?}), want {want:#010x}",
-            inp[0],
-            f32::from_bits(got),
-        );
-    });
-    // Spot-check the reference itself: 0x5 -> 0.3125, 0x8 -> -0.5, 0xF -> -0.0625.
-    assert_eq!(nibble(0xABCD_EF05), 0.3125);
-    assert_eq!(nibble(8), -0.5);
-    assert_eq!(nibble(0xF), -0.0625);
 }
 
 #[test]
@@ -964,129 +573,6 @@ fn v_fract_f16_never_returns_one() {
             ),
         }
     });
-}
-
-/// An f32 result: exactly these bits, any NaN, or within the 1 ULP the
-/// RDNA2 ISA gives the transcendental ops (same sign, finite).
-#[derive(Clone, Copy, Debug)]
-enum F32Want {
-    Bits(u32),
-    Nan,
-    Ulp1(f32),
-}
-
-impl F32Want {
-    fn holds(self, got: u32) -> bool {
-        match self {
-            Self::Bits(b) => got == b,
-            Self::Nan => f32::from_bits(got).is_nan(),
-            Self::Ulp1(v) => {
-                let v = v.to_bits();
-                f32::from_bits(got).is_finite() && (got ^ v) >> 31 == 0 && got.abs_diff(v) <= 1
-            }
-        }
-    }
-}
-
-#[test]
-fn rcp_rsq_sqrt_log_exp_f32_special_values_match_rdna2() {
-    use F32Want::{Bits, Nan, Ulp1};
-    let f = f32::to_bits;
-    let (pinf, ninf, nz, nan) = (0x7F80_0000, 0xFF80_0000, 0x8000_0000, 0x7FC0_0000);
-    let rcp: &[(u32, F32Want)] = &[
-        (0, Bits(pinf)),
-        (nz, Bits(ninf)),
-        (pinf, Bits(0)),
-        (ninf, Bits(nz)),
-        (nan, Nan),
-        (f(2.0), Ulp1(0.5)),
-        (f(-4.0), Ulp1(-0.25)),
-        (f(3.0), Ulp1(1.0 / 3.0)),
-        (f(1e-30), Ulp1((1.0 / f64::from(1e-30f32)) as f32)),
-    ];
-    // (VOP1 opcode, name, cases); v_log_f32 is log2, v_exp_f32 is 2^x.
-    type Cases<'a> = &'a [(u32, F32Want)];
-    let ops: &[(u16, &str, Cases)] = &[
-        (0x02a, "v_rcp_f32", rcp),
-        (0x02b, "v_rcp_iflag_f32", rcp),
-        (
-            0x02e,
-            "v_rsq_f32",
-            &[
-                (0, Bits(pinf)),
-                (nz, Bits(ninf)),
-                (pinf, Bits(0)),
-                (ninf, Nan),
-                (f(-1.0), Nan),
-                (nan, Nan),
-                (f(4.0), Ulp1(0.5)),
-                (f(0.25), Ulp1(2.0)),
-                (f(2.0), Ulp1(std::f32::consts::FRAC_1_SQRT_2)),
-            ],
-        ),
-        (
-            0x033,
-            "v_sqrt_f32",
-            &[
-                (0, Bits(0)),
-                (nz, Bits(nz)),
-                (pinf, Bits(pinf)),
-                (ninf, Nan),
-                (f(-1.0), Nan),
-                (f(-1e-30), Nan),
-                (nan, Nan),
-                (f(4.0), Ulp1(2.0)),
-                (f(2.0), Ulp1(std::f32::consts::SQRT_2)),
-                (f(1e30), Ulp1(f64::from(1e30f32).sqrt() as f32)),
-            ],
-        ),
-        (
-            0x027,
-            "v_log_f32",
-            &[
-                (0, Bits(ninf)),
-                (nz, Bits(ninf)),
-                (pinf, Bits(pinf)),
-                (ninf, Nan),
-                (f(-1.0), Nan),
-                (nan, Nan),
-                (f(1.0), Ulp1(0.0)),
-                (f(8.0), Ulp1(3.0)),
-                (f(0.125), Ulp1(-3.0)),
-                (f(3.0), Ulp1(3f64.log2() as f32)),
-            ],
-        ),
-        (
-            0x025,
-            "v_exp_f32",
-            &[
-                (ninf, Bits(0)),
-                (pinf, Bits(pinf)),
-                (nan, Nan),
-                (0, Ulp1(1.0)),
-                (nz, Ulp1(1.0)),
-                (f(3.0), Ulp1(8.0)),
-                (f(-3.0), Ulp1(0.125)),
-                (f(0.5), Ulp1(std::f32::consts::SQRT_2)),
-                (f(128.0), Bits(pinf)),
-                (f(-200.0), Bits(0)),
-            ],
-        ),
-    ];
-    for &(op, name, cases) in ops {
-        let shader = build_valu_cs(&[vop1(op, 0, vgpr(1))]);
-        let inputs: Vec<[u32; 4]> = cases.iter().map(|&(x, _)| [x, 0, 0, 0]).collect();
-        run_cases(&shader, &inputs, |backend, i, inp, got| {
-            let want = cases[i].1;
-            assert!(
-                want.holds(got),
-                "{backend}: {name}({:#010x} = {:?}) = {got:#010x} ({:?}), want {want:?}",
-                inp[0],
-                f32::from_bits(inp[0]),
-                f32::from_bits(got),
-            );
-        });
-    }
 }
 
 /// RDNA2's flt16_to_snorm16 / flt16_to_unorm16: clamp, scale by 32767 or
@@ -1276,40 +762,6 @@ fn v_cvt_u16_and_i16_f16_saturate() {
 }
 
 #[test]
-fn v_cvt_f16_u16_and_i16_widen_the_integer_first() {
-    // v_mov_b32 v0, 0; v_cvt_f16_u16 / v_cvt_f16_i16 v0, v1 (VOP1 0x050 / 0x051).
-    // Only integers f16 holds exactly: how the others round is the narrowing's
-    // business, not this conversion's. `None`: the result depends on rounding.
-    let cases: &[(u16, Option<u16>, Option<u16>)] = &[
-        // (u16 / i16 input bits, f16 of the unsigned value, f16 of the signed value)
-        (0x0000, Some(0x0000), Some(0x0000)), // 0
-        (0x0001, Some(0x3C00), Some(0x3C00)), // 1.0
-        (0x07FF, Some(0x67FF), Some(0x67FF)), // 2047, the last integer below 2048 that f16 holds
-        (0x8000, Some(0x7800), Some(0xF800)), // 32768 / -32768
-        (0xFC00, Some(0x7BE0), Some(0xE400)), // 64512 / -1024
-        (0xFFFE, None, Some(0xC000)),         // 65534 does not fit f16 / -2
-        (0xFFFF, None, Some(0xBC00)),         // 65535 does not fit f16 / -1
-    ];
-    for (op, what, pick) in [
-        (0x050u16, "v_cvt_f16_u16", 0usize),
-        (0x051, "v_cvt_f16_i16", 1),
-    ] {
-        let shader = build_valu_cs(&[vop1(0x001, 0, 128), vop1(op, 0, vgpr(1))]);
-        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| [u32::from(c.0), 0, 0, 0]).collect();
-        run_cases(&shader, &inputs, |backend, i, _, got| {
-            let want = if pick == 0 { cases[i].1 } else { cases[i].2 };
-            let Some(want) = want else { return };
-            assert_eq!(
-                got,
-                u32::from(want),
-                "{backend}: {what}({:#06x}) = {got:#010x}, want {want:#06x}",
-                cases[i].0,
-            );
-        });
-    }
-}
-
-#[test]
 fn v_sin_and_v_cos_f16_reduce_large_turns() {
     let sin_shader = build_valu_cs(&[vop1(0x060, 0, vgpr(1))]);
     let cos_shader = build_valu_cs(&[vop1(0x061, 0, vgpr(1))]);
@@ -1390,38 +842,6 @@ fn v_sin_and_v_cos_f16_reduce_large_turns() {
     });
 }
 
-/// A 32-bit literal in a signed 64-bit operand is sign-extended (an
-/// unsigned one's is zero-extended): -100 compared with `v[1:2]`, and
-/// shifted by `s_ashr_i64`.
-#[test]
-fn signed_64_bit_operands_sign_extend_their_literal() {
-    const MINUS_100: u32 = -100_i32 as u32;
-    let check = |name: &str, body: &[u32], cases: &[([u32; 4], u32)]| {
-        let shader = build_valu_cs(body);
-        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
-        run_cases(&shader, &inputs, |backend, i, inp, got| {
-            let want = cases[i].1;
-            assert_eq!(got, want, "{backend}: {name} {inp:x?}");
-        });
-    };
-    // v_cmp_*_i64 s6, v[1:2], -100 (VOP3, literal src1), then
-    // v_cndmask_b32 v0, 0, 1, s6.
-    let compare = |op: u16| {
-        let [a, b] = vop3(op, 6, vgpr(1), 255, 0);
-        let [c, d] = vop3(0x101, 0, 0x80, 0x81, sgpr(6));
-        [a, b, MINUS_100, c, d]
-    };
-    // An i64 as the two input dwords of `v[1:2]`.
-    let pair = |n: i64| [n as u32, (n >> 32) as u32, 0, 0];
-    let eq = [(pair(-100), 1), ([MINUS_100, 0, 0, 0], 0), (pair(0), 0)];
-    check("v_cmp_eq_i64", &compare(0x0A2), &eq);
-    let lt = [(pair(-200), 1), (pair(-50), 0), (pair(0), 0)];
-    check("v_cmp_lt_i64", &compare(0x0A1), &lt);
-    // s_ashr_i64 s[6:7], -100, 4; v_mov_b32 v0, s7: the high dword.
-    let ashr = [sop2(0x23, 6, 255, 0x84), MINUS_100, vop1(0x001, 0, sgpr(7))];
-    check("s_ashr_i64", &ashr, &[([0; 4], u32::MAX)]);
-}
-
 #[test]
 fn bfe_signed_and_unsigned_match_rdna2() {
     // v_bfe_i32 v0, v1, v2, v3 (VOP3 opcode 0x149)
@@ -1493,190 +913,6 @@ fn bfe_signed_and_unsigned_match_rdna2() {
             inp[0], inp[1], inp[2],
         );
     });
-
-    // s_bfe_u32 s6, s0, s1 (SOP2 opcode 0x27): the same 7-bit width as the signed form,
-    // so width=32 keeps all 32 bits and nothing is sign-extended.
-    let s_unsigned = build_valu_cs(&[sop2(0x27, 6, 0, 1), vop1(0x001, 0, sgpr(6))]);
-    let mut su_cases = unsigned_cases.to_vec();
-    su_cases.push(([0x8000_0000, 4, 32, 0], 0x0800_0000));
-    let su_in: Vec<[u32; 4]> = su_cases
-        .iter()
-        .map(|&(inp, _)| [inp[0], (inp[1] & 31) | ((inp[2] & 0x7F) << 16), 0, 0])
-        .collect();
-    run_cases(&s_unsigned, &su_in, |backend, i, inp, got| {
-        let want = su_cases[i].1;
-        assert_eq!(
-            got, want,
-            "{backend}: s_bfe_u32({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
-            inp[0], inp[1],
-        );
-    });
-}
-
-#[test]
-fn v_cmp_class_f32_matches_rdna2() {
-    // v_cmp_class_f32_e64 s6, v1, v2 (VOP3 opcode 0x088); v_cndmask_b32_e64 v0, 0, 1, s6
-    let cmp = build_valu_cs(&[
-        vop3(0x088, 6, vgpr(1), vgpr(2), 0)[0],
-        vop3(0x088, 6, vgpr(1), vgpr(2), 0)[1],
-        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[0],
-        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[1],
-    ]);
-
-    // All 10 IEEE-754 binary32 classes: bit k corresponds to class k.
-    let classes: &[(u32, u32)] = &[
-        (0x7F80_0001, 0), // +sNaN (quiet bit 0x0040_0000 clear)
-        (0xFFBF_FFFF, 0), // -sNaN (sign ignored for NaNs)
-        (0x7FC0_0000, 1), // +qNaN
-        (0xFFC0_0001, 1), // -qNaN
-        (0xFF80_0000, 2), // -inf
-        (0xBF80_0000, 3), // -normal (-1.0)
-        (0x8000_0001, 4), // -denormal
-        (0x8000_0000, 5), // -0.0
-        (0x0000_0000, 6), // +0.0
-        (0x0000_0001, 7), // +denormal
-        (0x3F80_0000, 8), // +normal (+1.0)
-        (0x7F80_0000, 9), // +inf
-    ];
-    let mut cases = Vec::new();
-    for &(bits, cls) in classes {
-        // Exact class bit -> true; complement of class bit across all 10 bits -> false.
-        cases.push(([bits, 1u32 << cls, 0, 0], 1u32));
-        cases.push(([bits, 0x3FF & !(1u32 << cls), 0, 0], 0u32));
-    }
-    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
-    run_cases(&cmp, &inputs, |backend, i, inp, got| {
-        let want = cases[i].1;
-        assert_eq!(
-            got, want,
-            "{backend}: v_cmp_class_f32({:#010x}, {:#05x}) = {got}, want {want}",
-            inp[0], inp[1],
-        );
-    });
-}
-
-#[test]
-fn compute_uses_a_reloaded_lane_mask_for_select() {
-    // Select with the complement of (v1 == v2) after a spill to lane 3.
-    let [compare, compare_operands] = vop3(0x0c2, 6, vgpr(1), vgpr(2), 0);
-    let [spill, spill_operands] = vop3(0x361, 5, sgpr(7), 0x83, 0);
-    let [reload, reload_operands] = vop3(0x360, 20, vgpr(5), 0x83, 0);
-    let [select, select_operands] = vop3(0x101, 0, 0x91, 0x9d, sgpr(20));
-    let shader = build_valu_cs(&[
-        compare,
-        compare_operands,
-        sop2(0x12, 7, 6, 0xc1), // s_xor_b32 s7, s6, -1
-        spill,
-        spill_operands,
-        reload,
-        reload_operands,
-        select,
-        select_operands,
-    ]);
-
-    let cases = [[7, 7, 0, 0], [7, 9, 0, 0]];
-    run_cases(&shader, &cases, |backend, _, [a, b, ..], result| {
-        assert_eq!(result, if a == b { 17 } else { 29 }, "{backend}: {a}, {b}");
-        eprintln!("{backend}: {a}, {b} -> {result}");
-    });
-}
-
-/// SOPC `op src0, src1`.
-const fn sopc(op: u8, src0: u8, src1: u8) -> u32 {
-    0xBF00_0000 | (op as u32) << 16 | (src1 as u32) << 8 | src0 as u32
-}
-
-/// `s_cselect_b32 s12, 1, 0; v_mov_b32 v0, s12`: SCC as 0 or 1 in v0.
-fn scc_to_v0() -> [u32; 2] {
-    [sop2(0x0A, 12, 129, 128), vop1(0x001, 0, sgpr(12))]
-}
-
-#[test]
-fn s_bfe_64_extracts_and_sets_scc() {
-    // s_bfe_u64 / s_bfe_i64 s[6:7], s[0:1], s2 (SOP2 0x29 / 0x2a: s2 = off[5:0]
-    // | width[22:16]); the result's low dword, high dword or SCC goes to v0.
-    let result = |op: u8, tail: &[u32]| {
-        let mut body = vec![sop2(op, 6, 0, 2)];
-        body.extend_from_slice(tail);
-        build_valu_cs(&body)
-    };
-    let lo = |op| result(op, &[vop1(0x001, 0, sgpr(6))]);
-    let hi = |op| result(op, &[vop1(0x001, 0, sgpr(7))]);
-    let scc = |op| result(op, &scc_to_v0());
-    let field = |off: u32, width: u32| off | width << 16;
-    let x = 0xFEDC_BA98_7654_3210u64;
-    // (src, offset, width, signed, expected)
-    let cases: &[(u64, u32, u32, bool, u64)] = &[
-        (x, 32, 16, false, 0xBA98),
-        (x, 32, 16, true, 0xFFFF_FFFF_FFFF_BA98),
-        (x, 0, 8, true, 0x10),
-        (x, 4, 40, false, 0x00A9_8765_4321),
-        (x, 56, 4, true, 0xFFFF_FFFF_FFFF_FFFE),
-        (x, 60, 4, false, 0xF),
-        (x, 8, 0, false, 0),
-        (x, 8, 0, true, 0),
-        (0x0000_00F0_0000_0000, 0, 32, false, 0),
-        (0x0000_00F0_0000_0000, 36, 4, true, 0xFFFF_FFFF_FFFF_FFFF),
-        (0x0000_00F0_0000_0000, 36, 4, false, 0xF),
-        (0x0000_00F0_0000_0000, 32, 4, true, 0),
-    ];
-    for &(src, off, width, signed, want) in cases {
-        let op = if signed { 0x2A } else { 0x29 };
-        let inputs = [[src as u32, (src >> 32) as u32, field(off, width), 0]];
-        let what = format!("s_bfe_{}64({src:#018x}, {off}, {width})", ["u", "i"][signed as usize]);
-        run_cases(&lo(op), &inputs, |backend, _, _, got| {
-            assert_eq!(got, want as u32, "{backend}: {what} low dword = {got:#010x}");
-        });
-        run_cases(&hi(op), &inputs, |backend, _, _, got| {
-            assert_eq!(got, (want >> 32) as u32, "{backend}: {what} high dword = {got:#010x}");
-        });
-        run_cases(&scc(op), &inputs, |backend, _, _, got| {
-            assert_eq!(got, (want != 0) as u32, "{backend}: {what} SCC = {got}");
-        });
-    }
-}
-
-#[test]
-fn s_bfm_b64_builds_a_mask_and_keeps_scc() {
-    // s_cmp_lg_u32 s3, 0 sets SCC from s3; s_bfm_b64 s[6:7], s0, s1 (SOP2
-    // 0x25: width s0[5:0], offset s1[5:0]) must leave it alone.
-    let prefix = [sopc(0x07, 3, 128), sop2(0x25, 6, 0, 1)];
-    let build = |tail: &[u32]| build_valu_cs(&[&prefix[..], tail].concat());
-    let (lo, hi) = (
-        build(&[vop1(0x001, 0, sgpr(6))]),
-        build(&[vop1(0x001, 0, sgpr(7))]),
-    );
-    let scc = build(&scc_to_v0());
-    // (width, offset, expected)
-    let cases: &[(u32, u32, u64)] = &[
-        (40, 8, 0x0000_FFFF_FFFF_FF00),
-        (32, 8, 0x0000_00FF_FFFF_FF00),
-        (0, 5, 0),
-        (1, 63, 0x8000_0000_0000_0000),
-        (32, 0, 0x0000_0000_FFFF_FFFF),
-        (32, 32, 0xFFFF_FFFF_0000_0000),
-        (63, 0, 0x7FFF_FFFF_FFFF_FFFF),
-        (4, 0x80 | 2, 0x0000_0000_0000_003C), // only bits 5:0 count
-    ];
-    for &(width, off, want) in cases {
-        let inputs = [[width, off, 0, 0]];
-        run_cases(&lo, &inputs, |backend, _, _, got| {
-            assert_eq!(got, want as u32, "{backend}: s_bfm_b64({width}, {off}) low = {got:#010x}");
-        });
-        run_cases(&hi, &inputs, |backend, _, _, got| {
-            assert_eq!(
-                got,
-                (want >> 32) as u32,
-                "{backend}: s_bfm_b64({width}, {off}) high = {got:#010x}",
-            );
-        });
-        // SCC keeps the compare's value whether or not the mask is empty.
-        for s3 in [0u32, 1] {
-            run_cases(&scc, &[[width, off, 0, s3]], |backend, _, _, got| {
-                assert_eq!(got, s3, "{backend}: s_bfm_b64({width}, {off}) changed SCC {s3} to {got}");
-            });
-        }
-    }
 }
 
 #[test]
@@ -2027,60 +1263,4 @@ fn v_cmp_class_f16_matches_rdna2() {
             inp[0], inp[1],
         );
     });
-}
-
-/// SCC after the SOP2 `op s12, s0, s1`, read back into `v0` through
-/// `s_cselect_b32 s13, 1, 0`.
-fn scc_after(op: u8) -> HostShader {
-    build_valu_cs(&[
-        sop2(op, 12, 0, 1),
-        sop2(0x0A, 13, 129, 128), // s_cselect_b32 s13, 1, 0
-        vop1(0x001, 0, sgpr(13)), // v_mov_b32 v0, s13
-    ])
-}
-
-/// Checks the SCC that `op` leaves for each `(s0, s1, scc)`.
-fn check_scc(name: &str, op: u8, cases: &[(u32, u32, u32)]) {
-    let inputs: Vec<[u32; 4]> = cases.iter().map(|&(a, b, _)| [a, b, 0, 0]).collect();
-    run_cases(&scc_after(op), &inputs, |backend, i, inp, got| {
-        let want = cases[i].2;
-        assert_eq!(
-            got, want,
-            "{backend}: SCC after {name}({:#010x}, {:#010x}) = {got}, want {want}",
-            inp[0], inp[1],
-        );
-    });
-}
-
-#[test]
-fn s_min_and_s_max_set_scc_when_src0_is_chosen() {
-    let m1 = (-1i32) as u32;
-    check_scc("s_min_i32", 0x06, &[(m1, 2, 1), (2, m1, 0), (4, 4, 0)]);
-    check_scc("s_min_u32", 0x07, &[(3, 5, 1), (5, 3, 0), (4, 4, 0)]);
-    check_scc("s_max_i32", 0x08, &[(2, m1, 1), (m1, 2, 0), (4, 4, 0)]);
-    check_scc("s_max_u32", 0x09, &[(5, 3, 1), (3, 5, 0), (4, 4, 0)]);
-}
-
-#[test]
-fn s_lshl_add_sets_scc_on_unsigned_overflow() {
-    // (s0 << n) + s1 past 32 bits, through the shift or through the add.
-    check_scc(
-        "s_lshl1_add_u32",
-        0x2E,
-        &[
-            (1, 2, 0),
-            (1, 0xFFFF_FFFD, 0),
-            (1, 0xFFFF_FFFE, 1),
-            (0x8000_0000, 0, 1),
-        ],
-    );
-    check_scc(
-        "s_lshl4_add_u32",
-        0x31,
-        &[
-            (0x0FFF_FFFF, 0xF, 0),
-            (0x0FFF_FFFF, 0x10, 1),
-            (0x1000_0000, 0, 1),
-        ],
-    );
 }

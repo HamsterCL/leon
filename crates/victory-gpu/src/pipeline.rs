@@ -63,10 +63,6 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
-    /// Whether its native program runs in 64-lane console waves
-    /// (diagnostics: `VICTORY_SKIP_WAVE64`).
-    #[cfg(all(windows, feature = "diagnostics"))]
-    wave64: OnceLock<bool>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -105,16 +101,9 @@ pub(crate) fn kept() -> [u64; 7] {
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
-    let entry = shaders
+    shaders
         .get_or_insert_with(HashMap::new)
-        .entry(*full.as_bytes());
-    if matches!(entry, std::collections::hash_map::Entry::Occupied(_)) {
-        victory_profile::cache!("shader", "containers", Hit);
-    } else {
-        victory_profile::cache!("shader", "containers", Miss);
-        victory_profile::resident!("shader", "containers", bytes.len());
-    }
-    entry
+        .entry(*full.as_bytes())
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -124,8 +113,6 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
-                #[cfg(all(windows, feature = "diagnostics"))]
-                wave64: OnceLock::new(),
             })
         })
         .clone()
@@ -148,7 +135,6 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                victory_profile::scope!("shader", "translate", self.container.len());
                 let done = translate(&self.container);
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
@@ -405,15 +391,7 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     if this.is_null() {
         return None;
     }
-    let p = pipeline(this);
-    if victory_profile::on() {
-        if make::is_made(&p.host) {
-            victory_profile::cache!("gpu", "host pipelines", Hit);
-        } else {
-            victory_profile::cache!("gpu", "host pipelines", Miss);
-        }
-    }
-    make::ready(&p.host)
+    make::ready(&pipeline(this).host)
 }
 
 /// Host pipelines queued and not made yet.
@@ -448,87 +426,25 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-/// The stages `VICTORY_SKIP_WAVE64` names (`mesh`, `compute`, `vertex`,
-/// `pixel`).
-#[cfg(all(windows, feature = "diagnostics"))]
-fn parse_skip_stages(value: &str) -> Vec<&'static str> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| {
-            let stage = ["mesh", "compute", "vertex", "pixel"]
-                .into_iter()
-                .find(|&k| k.eq_ignore_ascii_case(s));
-            if stage.is_none() {
-                tracing::warn!(
-                    stage = s,
-                    "VICTORY_SKIP_WAVE64 expects mesh, compute, vertex or pixel"
-                );
-            }
-            stage
-        })
-        .collect()
-}
-
-#[cfg(all(windows, feature = "diagnostics"))]
-impl Shader {
-    /// Whether the container's native program runs in 64-lane console waves.
-    fn wave64(&self) -> bool {
-        *self.wave64.get_or_init(|| {
-            victory_shader::Container::parse(&self.container)
-                .ok()
-                .and_then(|c| {
-                    c.part(victory_shader::FourCC::DXIL)
-                        .map(|p| p.data.to_vec())
-                })
-                .and_then(|d| victory_shader::native::native_programs(&d).ok())
-                .is_some_and(|ps| ps.iter().any(|p| p.wave64))
-        })
-    }
-}
-
 #[cfg(all(windows, feature = "diagnostics"))]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
-    static WAVE64: OnceLock<Vec<&'static str>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
     });
-    let wave64 = WAVE64.get_or_init(|| {
-        let value = std::env::var("VICTORY_SKIP_WAVE64").unwrap_or_default();
-        parse_skip_stages(&value)
-    });
-    if hashes.is_empty() && wave64.is_empty() {
+    if hashes.is_empty() {
         return None;
     }
     p.shaders
         .iter()
-        .find(|shader| {
-            hashes.contains(&shader.hash) || (wave64.contains(&shader.stage) && shader.wave64())
-        })
+        .find(|shader| hashes.contains(&shader.hash))
         .map(|shader| shader.hash.as_str())
 }
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
-}
-
-/// Why a draw or dispatch of `this` is dropped, in words (diagnostics).
-#[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn drop_reason(this: This) -> String {
-    if this.is_null() {
-        return "no pipeline set".to_owned();
-    }
-    let p = pipeline(this);
-    skipped_shader(p)
-        .map(|hash| format!("skipped shader {hash}"))
-        .or_else(|| make::missing(&p.host))
-        .unwrap_or_else(|| {
-            "has a host pipeline (prepare or bind failed, or another kind of pipeline)".to_owned()
-        })
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
@@ -734,16 +650,6 @@ pub(crate) extern "system" fn create_stream(
             );
             break;
         };
-        if size > desc.size - at {
-            tracing::warn!(
-                kind,
-                at,
-                size,
-                total = desc.size,
-                "truncated pipeline subobject; the rest is ignored"
-            );
-            break;
-        }
         if let Some(stage) = stage {
             // SAFETY: a shader subobject has its bytecode at +8.
             let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
@@ -785,8 +691,6 @@ static FUNCTIONS: Table<24> = {
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
-mod journal;
-#[cfg(windows)]
 mod library;
 #[cfg(windows)]
 mod make;
@@ -809,7 +713,6 @@ pub(crate) fn library_removal_note() -> String {
 /// early, in `dir` (a folder of the cache) across runs.
 #[cfg(windows)]
 pub fn use_pipeline_cache(dir: std::path::PathBuf) {
-    journal::use_dir(dir.with_file_name("pipeline-journal"));
     library::use_pipeline_cache(dir);
 }
 
@@ -821,17 +724,6 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(windows, feature = "diagnostics"))]
-    #[test]
-    fn skip_stages_names_known_stages_only() {
-        assert_eq!(
-            super::parse_skip_stages(" mesh,Compute ,,"),
-            ["mesh", "compute"]
-        );
-        assert_eq!(super::parse_skip_stages("hull,pixel"), ["pixel"]);
-        assert!(super::parse_skip_stages("").is_empty());
-    }
-
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
@@ -946,50 +838,6 @@ mod tests {
                 (g.targets.NumRenderTargets, g.targets.RTFormats[0].0),
                 (1, 28)
             );
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn truncated_stream_subobject_does_not_read_past_end() {
-        use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
-            VirtualFree, VirtualProtect,
-        };
-        // SAFETY: two fresh pages, the second PAGE_NOACCESS so reading past
-        // the end of the stream faults immediately.
-        unsafe {
-            let page = VirtualAlloc(
-                std::ptr::null(),
-                0x2000,
-                MEM_RESERVE | MEM_COMMIT,
-                PAGE_READWRITE,
-            )
-            .cast::<u8>();
-            assert!(!page.is_null());
-            let mut old = 0;
-            assert_ne!(
-                VirtualProtect(page.add(0x1000).cast(), 0x1000, PAGE_NOACCESS, &mut old),
-                0
-            );
-            let tail = page.add(0x1000 - 8);
-            // Kind 1 (vertex shader, 24 bytes) and kind 8 (blend state, 336 bytes)
-            // with only 8 bytes left before the guard page.
-            for kind in [1u64, 8u64] {
-                tail.copy_from_nonoverlapping(kind.to_le_bytes().as_ptr(), 8);
-                let desc = StreamDesc {
-                    size: 8,
-                    stream: tail,
-                };
-                let mut p = std::ptr::null();
-                assert_eq!(
-                    create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
-                    S_OK
-                );
-                assert!(shaders(p).is_empty());
-                assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
-            }
-            VirtualFree(page.cast(), 0, MEM_RELEASE);
         }
     }
 }

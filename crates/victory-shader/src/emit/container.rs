@@ -1,7 +1,7 @@
 //! The PC container around emitted DXIL: feature flags (`SFI0`), the
 //! signatures (`ISG1`, `OSG1`), pipeline state validation (`PSV0`) and the
-//! program (`DXIL`), laid out as validator versions 1.6 and 1.8 lay them out,
-//! plus the container hash that D3D12 checks.
+//! program (`DXIL`), laid out as validator version 1.6 lays them out, plus
+//! the container hash that D3D12 checks.
 
 /// One signature element: one row (D3D12 links stages by semantic).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,32 +25,6 @@ pub(crate) struct SigElement {
 }
 
 impl SigElement {
-    /// Canonical DXIL semantic name for system values (`kind != 0`), matching
-    /// what `dxil.dll` writes when regenerating `ISG1`/`OSG1` during validation.
-    fn canonical_name(&self) -> &str {
-        match self.kind {
-            1 => "SV_VertexID",
-            2 => "SV_InstanceID",
-            3 => "SV_Position",
-            4 => "SV_RenderTargetArrayIndex",
-            5 => "SV_ViewportArrayIndex",
-            6 => "SV_ClipDistance",
-            7 => "SV_CullDistance",
-            10 => "SV_PrimitiveID",
-            12 => "SV_SampleIndex",
-            13 => "SV_IsFrontFace",
-            14 => "SV_Coverage",
-            15 => "SV_InnerCoverage",
-            16 => "SV_Target",
-            17 => "SV_Depth",
-            18 => "SV_DepthLessEqual",
-            19 => "SV_DepthGreaterEqual",
-            20 => "SV_StencilRef",
-            30 => "SV_CullPrimitive",
-            _ => &self.name,
-        }
-    }
-
     fn system_value(&self) -> u32 {
         match self.kind {
             1 => 6,  // vertex id
@@ -98,9 +72,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     // Validator 1.6 writes one name per element in element order, repeats
     // included, except that system values share theirs (it keys names by
     // the semantic's string, which is one static string per system value);
-    // the rows sorted by register (unallocated last), then by name offset,
-    // not column (its `sort_sig`): rows of one register keep element order,
-    // apart from system values.
+    // the rows sorted by register (unallocated last).
     let mut offsets: Vec<u32> = Vec::new();
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
@@ -111,15 +83,14 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         match shared {
             Some(j) => offsets.push(offsets[j]),
             None => {
-                let name = e.canonical_name();
                 offsets.push(next);
-                next += name.len() as u32 + 1;
-                names.push(name);
+                next += e.name.len() as u32 + 1;
+                names.push(&e.name);
             }
         }
     }
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), offsets[i]));
+    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
         let used = e.usage << e.col;
@@ -190,11 +161,9 @@ pub(crate) struct Psv<'a> {
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
     pub wave_size: Option<u32>,
-    /// Validator 1.8: runtime info 3 and the entry-point name.
-    pub validator18: bool,
 }
 
-/// `PSV0` with runtime info version 2, or 3 for validator 1.8.
+/// `PSV0` with runtime info version 2 (validator 1.6).
 pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     let vectors = |els: &[SigElement]| {
         els.iter()
@@ -210,9 +179,8 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             out.extend(v.to_le_bytes());
         }
     };
-    let info_size = if p.validator18 { 52 } else { 48 };
-    u32s(&mut out, &[info_size]);
-    let mut info = [0u8; 52];
+    u32s(&mut out, &[48]);
+    let mut info = [0u8; 48];
     info[0] = u8::from(p.flag);
     if p.stage == 0 {
         // PSInfo.SampleFrequency: an input interpolated per sample, or the
@@ -262,13 +230,8 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             );
         }
     }
-    // The optional entry point and arbitrary semantics (system values use ""),
-    // then indices.
-    let mut strings = if p.validator18 {
-        b"\0main\0".to_vec()
-    } else {
-        vec![0]
-    };
+    // Names of arbitrary semantics (system values use ""), then indices.
+    let mut strings = vec![0u8];
     let mut indices: Vec<u32> = Vec::new();
     let mut elements = Vec::new();
     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {
@@ -406,40 +369,21 @@ pub(crate) fn hash(data: &[u8]) -> [u8; 16] {
 
 fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
     const S: [u32; 16] = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
-    const K: [u32; 64] = [
-        0xd76a_a478, 0xe8c7_b756, 0x2420_70db, 0xc1bd_ceee,
-        0xf57c_0faf, 0x4787_c62a, 0xa830_4613, 0xfd46_9501,
-        0x6980_98d8, 0x8b44_f7af, 0xffff_5bb1, 0x895c_d7be,
-        0x6b90_1122, 0xfd98_7193, 0xa679_438e, 0x49b4_0821,
-        0xf61e_2562, 0xc040_b340, 0x265e_5a51, 0xe9b6_c7aa,
-        0xd62f_105d, 0x0244_1453, 0xd8a1_e681, 0xe7d3_fbc8,
-        0x21e1_cde6, 0xc337_07d6, 0xf4d5_0d87, 0x455a_14ed,
-        0xa9e3_e905, 0xfcef_a3f8, 0x676f_02d9, 0x8d2a_4c8a,
-        0xfffa_3942, 0x8771_f681, 0x6d9d_6122, 0xfde5_380c,
-        0xa4be_ea44, 0x4bde_cfa9, 0xf6bb_4b60, 0xbebf_bc70,
-        0x289b_7ec6, 0xeaa1_27fa, 0xd4ef_3085, 0x0488_1d05,
-        0xd9d4_d039, 0xe6db_99e5, 0x1fa2_7cf8, 0xc4ac_5665,
-        0xf429_2244, 0x432a_ff97, 0xab94_23a7, 0xfc93_a039,
-        0x655b_59c3, 0x8f0c_cc92, 0xffef_f47d, 0x8584_5dd1,
-        0x6fa8_7e4f, 0xfe2c_e6e0, 0xa301_4314, 0x4e08_11a1,
-        0xf753_7e82, 0xbd3a_f235, 0x2ad7_d2bb, 0xeb86_d391,
-    ];
-    let x: [u32; 16] = std::array::from_fn(|i| {
-        u32::from_le_bytes([
-            block[4 * i],
-            block[4 * i + 1],
-            block[4 * i + 2],
-            block[4 * i + 3],
-        ])
-    });
+    let x: Vec<u32> = block
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
+        .collect();
     let [mut a, mut b, mut c, mut d] = *state;
-    for (i, &k) in K.iter().enumerate() {
+    for i in 0..64 {
         let (f, g) = match i / 16 {
             0 => ((b & c) | (!b & d), i),
             1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
             2 => (b ^ c ^ d, (3 * i + 5) % 16),
             _ => (c ^ (b | !d), (7 * i) % 16),
         };
+        let k = ((i as f64 + 1.0).sin().abs() * 4_294_967_296.0) as u32;
         let rotated = a
             .wrapping_add(f)
             .wrapping_add(k)
@@ -471,42 +415,5 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
-    }
-
-    #[test]
-    fn rows_of_one_register_keep_element_order_not_column_order() {
-        let element = |name: &str, index, kind, row, col, cols| SigElement {
-            name: name.into(),
-            index,
-            kind,
-            comp: 9,
-            interp: if kind == 0 { 2 } else { 4 },
-            row: Some(row),
-            col,
-            cols,
-            usage: (1 << cols) - 1,
-            half: false,
-        };
-        // As a vertex program declares them: a w channel before the xyz of
-        // the same register.
-        let elements = [
-            element("SV_Position", 0, 3, 0, 0, 4),
-            element("TEXCOORD", 3, 0, 1, 3, 1),
-            element("NORMAL", 0, 0, 1, 0, 3),
-        ];
-        let part = signature(&elements, false);
-        let rows: Vec<(u32, u32)> = (0..3)
-            .map(|r| {
-                let word = |k: usize| {
-                    let at = 8 + 32 * r + 4 * k;
-                    u32::from_le_bytes(part[at..at + 4].try_into().unwrap())
-                };
-                // Semantic index and register.
-                (word(2), word(5))
-            })
-            .collect();
-        // Register order, then name offset (element order here), as the
-        // validator writes them: TEXCOORD3 before NORMAL0 in register 1.
-        assert_eq!(rows, [(0, 0), (3, 1), (0, 1)]);
     }
 }

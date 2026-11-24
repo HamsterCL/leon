@@ -1,7 +1,6 @@
 //! A DXIL vertex, pixel, compute or mesh shader under construction: the module,
 //! the `dx.op` declarations it calls, its signatures and bound resources,
-//! and the metadata and container that wrap it up (SM 6.6; validator 1.6,
-//! or 1.8 for compute derivatives).
+//! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
 use super::bitcode::{Attr, Md, Module, Ty, V};
 use super::container::{self, Binding, Psv, SigElement};
@@ -127,9 +126,6 @@ pub fn set_view_heap_limit(null_slot: u32) {
 
 pub(crate) struct Shader {
     pub m: Module,
-    /// Test builds: typed loads assembled from a dword-aligned pair.
-    #[cfg(test)]
-    pub unaligned_typed_loads: u32,
     pub t: Types,
     pub pixel: bool,
     pub inputs: Vec<SigElement>,
@@ -155,14 +151,10 @@ pub(crate) struct Shader {
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
-    /// Heap handles annotated as constant buffers.
-    pub cbuffer_handles: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
     pub wave_size: Option<u32>,
-    /// Compute derivatives require validator 1.8 rather than 1.6 or 1.7.
-    compute_derivatives: bool,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
     lds: Option<V>,
@@ -190,9 +182,6 @@ impl Shader {
         let entry = m.new_block();
         Shader {
             m,
-            #[cfg(test)]
-            #[cfg(test)]
-            unaligned_typed_loads: 0,
             t: Types {
                 void,
                 i1,
@@ -218,10 +207,8 @@ impl Shader {
             root_uavs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
-            cbuffer_handles: 0,
             threads: None,
             wave_size: None,
-            compute_derivatives: false,
             lds_dwords: 0,
             lds: None,
             main,
@@ -251,19 +238,6 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
-        // Validators before 1.8 reject gradient operations outside the
-        // pixel stage. This set matches DXC's gradient classification:
-        // the implicit-derivative samples (60/61/64) and the LOD query
-        // (81), plus the explicit derivatives (83..=86). Bfi and the dot
-        // products (53..=56) are arithmetic and stay on 1.6, and
-        // SampleGrad/SampleLevel (62/63) take explicit gradients, so the
-        // validator already accepts them in compute.
-        if self.threads.is_some()
-            && self.mesh.is_none()
-            && matches!(opcode, 60 | 61 | 64 | 81 | 83..=86)
-        {
-            self.compute_derivatives = true;
-        }
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
@@ -451,7 +425,6 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         self.nonuniform_handles += u32::from(nonuniform);
-        self.cbuffer_handles += u32::from(props.0 == 13);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
@@ -845,7 +818,6 @@ impl Shader {
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
-            validator18: self.compute_derivatives,
         });
         let hash = [0u8; 20];
         let psg1 = container::signature(&self.prims, false);
@@ -905,127 +877,5 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
-    }
-}
-
-#[cfg(all(test, windows))]
-mod tests {
-    use super::super::bitcode::Term;
-    use super::super::validator;
-    use super::*;
-
-    /// Builds a compute shader calling `opcode` and returns its container
-    /// plus the derivative flag as detected by `op`. `Some(v)` overrides
-    /// the flag before the container is written.
-    fn compute_with_op(
-        opcode: u32,
-        name: &str,
-        attr: Attr,
-        args: usize,
-        validator18: Option<bool>,
-    ) -> (Vec<u8>, bool) {
-        let mut s = Shader::new(false);
-        s.threads = Some([32, 1, 1]);
-        s.wave_size = Some(32);
-        let block = s.entry;
-        let zero = s.m.f32(0);
-        let args = vec![zero; args];
-        let ret = s.t.f32;
-        s.op(block, name, attr, ret, opcode, &args);
-        let detected = s.compute_derivatives;
-        if let Some(v) = validator18 {
-            s.compute_derivatives = v;
-        }
-        s.m.terminate(block, Term::Ret);
-        (s.finish(), detected)
-    }
-
-    #[test]
-    fn compute_implicit_sample_validates() {
-        let mut s = Shader::new(false);
-        s.threads = Some([32, 1, 1]);
-        s.wave_size = Some(32);
-        s.samplers = 1;
-        let block = s.entry;
-        let index = s.m.i32(0);
-        let texture = s.heap_handle(block, index, false, false, (2, 1033));
-        let sampler = s.sampler_handle(block, 0);
-        let zero = s.m.f32(0);
-        let fu = s.m.undef(s.t.f32);
-        let iu = s.m.undef(s.t.i32);
-        let args = [texture, sampler, zero, zero, fu, fu, iu, iu, iu, fu];
-        let ret = s.t.res_ret;
-        s.op(block, "sample.f32", Attr::ReadOnly, ret, 60, &args);
-        assert!(s.compute_derivatives);
-        s.m.terminate(block, Term::Ret);
-        let mut dxil = s.finish();
-        let path = validator::Validator::default_path();
-        let Ok(mut validator) = validator::Validator::load(path.as_deref()) else {
-            eprintln!("no dxil.dll; skipped");
-            return;
-        };
-        validator.validate(&mut dxil).unwrap();
-
-        // The same module declared as validator 1.6 must be rejected.
-        let mut legacy = {
-            let mut s = Shader::new(false);
-            s.threads = Some([32, 1, 1]);
-            s.wave_size = Some(32);
-            s.samplers = 1;
-            let block = s.entry;
-            let index = s.m.i32(0);
-            let texture = s.heap_handle(block, index, false, false, (2, 1033));
-            let sampler = s.sampler_handle(block, 0);
-            let zero = s.m.f32(0);
-            let fu = s.m.undef(s.t.f32);
-            let iu = s.m.undef(s.t.i32);
-            let args = [texture, sampler, zero, zero, fu, fu, iu, iu, iu, fu];
-            let ret = s.t.res_ret;
-            s.op(block, "sample.f32", Attr::ReadOnly, ret, 60, &args);
-            s.compute_derivatives = false;
-            s.m.terminate(block, Term::Ret);
-            s.finish()
-        };
-        // Whether a validator turns a 1.6 declaration away is its own choice;
-        // dxil.dll 1.8.2502.11 accepts it. What is ours (the derivative is
-        // detected and declared as 1.8) is asserted above.
-        if validator.validate(&mut legacy).is_ok() {
-            eprintln!("this dxil.dll accepts the 1.6 declaration; not asserted");
-        }
-    }
-
-    #[test]
-    fn compute_explicit_derivative_validates() {
-        // DerivCoarseX (83): rejected before validator 1.8 like the
-        // implicit-derivative samples.
-        let (mut dxil, detected) = compute_with_op(83, "unary.f32", Attr::ReadNone, 1, Some(true));
-        assert!(detected);
-        let (mut legacy, _) = compute_with_op(83, "unary.f32", Attr::ReadNone, 1, Some(false));
-        let path = validator::Validator::default_path();
-        let Ok(mut validator) = validator::Validator::load(path.as_deref()) else {
-            eprintln!("no dxil.dll; skipped");
-            return;
-        };
-        validator.validate(&mut dxil).unwrap();
-        // Whether a validator turns a 1.6 declaration away is its own choice;
-        // dxil.dll 1.8.2502.11 accepts it. What is ours (the derivative is
-        // detected and declared as 1.8) is asserted above.
-        if validator.validate(&mut legacy).is_ok() {
-            eprintln!("this dxil.dll accepts the 1.6 declaration; not asserted");
-        }
-    }
-
-    #[test]
-    fn compute_dot3_stays_on_validator_1_6() {
-        // Dot3 (55) is arithmetic, not a gradient op: it must not bump the
-        // validator version, and the resulting 1.6 module validates.
-        let (mut dxil, detected) = compute_with_op(55, "dot3.f32", Attr::ReadNone, 6, None);
-        assert!(!detected);
-        let path = validator::Validator::default_path();
-        let Ok(mut validator) = validator::Validator::load(path.as_deref()) else {
-            eprintln!("no dxil.dll; skipped");
-            return;
-        };
-        validator.validate(&mut dxil).unwrap();
     }
 }

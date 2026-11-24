@@ -115,9 +115,8 @@ struct List {
     /// [`allocate_upload`], kept until the list is reset; the host list the
     /// calls record into (decision 0007), and the draw state the title set.
     uploads: std::sync::Mutex<Vec<Vec<u8>>>,
-    /// Shared with submissions still to run (queues held back by a wait).
     #[cfg(windows)]
-    host: std::sync::Mutex<Option<std::sync::Arc<crate::host::HostList>>>,
+    host: Option<crate::host::HostList>,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
     /// The parts of the recording before `host`, in order, each closed: the
@@ -139,28 +138,6 @@ struct Part {
 }
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
-
-#[cfg(windows)]
-impl Drop for List {
-    fn drop(&mut self) {
-        let uploads = std::mem::take(self.uploads.get_mut().unwrap_or_else(|e| e.into_inner()));
-        if let Some(pending) = self
-            .host
-            .get_mut()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            && std::sync::Arc::strong_count(pending) > 1
-        {
-            pending.keep_uploads(uploads);
-            let dynamic = self
-                .state
-                .get_mut()
-                .unwrap_or_else(|e| e.into_inner())
-                .take_dynamic();
-            pending.keep_dynamic(dynamic);
-        }
-    }
-}
 
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
@@ -195,13 +172,12 @@ pub(crate) fn tables_done(lists: &[This]) {
 
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
-pub(crate) fn host_list(this: This) -> Option<std::sync::Arc<crate::host::HostList>> {
+pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     if this.is_null() {
         return None;
     }
     // SAFETY: the title passes one of our lists.
-    let host = unsafe { &(*this.cast::<List>()).host };
-    host.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    unsafe { (*this.cast::<List>()).host.as_ref() }
 }
 
 /// The host side of a submitted list, taken from it: a queue that waits
@@ -596,13 +572,13 @@ fn new_list(
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: std::sync::Mutex::new(crate::host::host().and_then(|h| match h.acquire_list() {
-            Ok(list) => Some(std::sync::Arc::new(list)),
+        host: crate::host::host().and_then(|h| match h.new_list() {
+            Ok(list) => Some(list),
             Err(e) => {
                 tracing::warn!(error = %e, "no host command list");
                 None
             }
-        })),
+        }),
         #[cfg(windows)]
         state: {
             let mut state = crate::draw::State::default();
@@ -673,9 +649,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     }
     #[cfg(windows)]
     with_state(this, |host, state| {
-        if !fresh && !keep_pending {
-            host.reset();
-        }
+        host.reset();
         state.reset(pipeline);
     });
     #[cfg(not(windows))]
@@ -772,7 +746,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
         let mut host: Vec<Barrier> = barriers
             .iter()
-            .filter_map(|b| host_barrier(&list, b))
+            .filter_map(|b| host_barrier(list, b))
             .collect();
         // Buffers have host copies, not resources the barrier can name:
         // a barrier on one waits for every shader write before it.
@@ -882,7 +856,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             // A source the title fills itself is uploaded first (upstream
             // PR #671): a copy read whatever the host texture held.
             if crate::texture::title_written(from) {
-                crate::texture::upload(&list, src, from);
+                crate::texture::upload(list, src, from);
             }
             // Depth textures shaders also write: what they wrote, first.
             list.twin_use(dst, false, true);
@@ -919,45 +893,9 @@ pub(crate) struct CopyLocation {
     footprint: crate::resource::PlacedFootprint,
 }
 
-/// Size of the source box, or of the selected mip/array/plane subresource
-/// when the caller asks D3D12 to copy the whole subresource.
-#[cfg(windows)]
-fn readback_extent(
-    host: &crate::host::Host,
-    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-    subresource: u32,
-    source_box: Option<&[u32; 6]>,
-) -> Option<[u32; 3]> {
-    if let Some(&[left, top, front, right, bottom, back]) = source_box {
-        return Some([
-            right.checked_sub(left)?,
-            bottom.checked_sub(top)?,
-            back.checked_sub(front)?,
-        ]);
-    }
-    use windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT;
-    let mut layout = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
-    let mut total = 0;
-    // SAFETY: the texture is live and both outputs hold one subresource's result.
-    unsafe {
-        host.device.GetCopyableFootprints(
-            &texture.GetDesc(),
-            subresource,
-            1,
-            0,
-            Some(&mut layout),
-            None,
-            None,
-            Some(&mut total),
-        );
-    }
-    let fp = layout.Footprint;
-    (total != u64::MAX).then_some([fp.Width, fp.Height, fp.Depth])
-}
-
-/// Texture to texture on the GPU, buffer to texture through an upload
-/// buffer filled at submission, and texture to buffer through a readback
-/// buffer copied into title memory once the submission completes.
+/// Texture to texture on the GPU; buffer to texture through an upload
+/// buffer filled at submission. Texture to buffer (read back) is not done
+/// yet.
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -980,156 +918,6 @@ extern "system" fn copy_texture_region(
         else {
             return;
         };
-        const _: () =
-            assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
-        let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
-        if dst.kind == FOOTPRINT {
-            if src.kind == FOOTPRINT {
-                return;
-            }
-            let (Some(host), Some(from_tex)) = (
-                crate::host::host(),
-                crate::resource::host_resource(src.resource),
-            ) else {
-                return;
-            };
-            let Some((lines, row_bytes, total)) = dst.footprint.layout() else {
-                return;
-            };
-            let host_format = crate::resource::pc_format(dst.footprint.format);
-            if crate::resource::element(host_format)
-                != crate::resource::element(dst.footprint.format)
-            {
-                // Console formats such as 118..=120 (3-byte D16S8) map to
-                // 4-byte PC substitutes (45..=47): raw readback would mis-size
-                // the staging buffer and write the wrong texel layout.
-                static ONCE: std::sync::Once = std::sync::Once::new();
-                ONCE.call_once(|| {
-                    tracing::warn!(
-                        format = dst.footprint.format,
-                        host_format,
-                        "texture-to-buffer readback skipped: host format has a different texel size",
-                    );
-                });
-                return;
-            }
-            if total == 0 || lines == 0 || row_bytes == 0 {
-                return;
-            }
-            // For a subresource location the first DWORD of the footprint union is its index.
-            let Some([width, height, depth]) = readback_extent(
-                host,
-                from_tex,
-                src.footprint.offset as u32,
-                // SAFETY: the optional source box is read during this call.
-                unsafe { source_box.as_ref() },
-            ) else {
-                return;
-            };
-            let footprint = dst.footprint;
-            let Some((element, block)) = crate::resource::element(footprint.format) else {
-                return;
-            };
-            // A BC mip's reported extent can include its final partial block.
-            // Measure the footprint and the copied area in the same storage units.
-            let rows_per_slice = u64::from(footprint.height).div_ceil(block);
-            let row_in_slice = u64::from(y) / block;
-            let first_row = u64::from(z) * rows_per_slice + row_in_slice;
-            let column_bytes = (u64::from(x) / block) * element;
-            let copy_rows = u64::from(height).div_ceil(block);
-            let copy_bytes = u64::from(width).div_ceil(block) * element;
-            if copy_bytes == 0
-                || copy_rows == 0
-                || depth == 0
-                || column_bytes + copy_bytes > row_bytes
-                || row_in_slice + copy_rows > rows_per_slice
-                || u64::from(z) + u64::from(depth) > u64::from(footprint.depth)
-            {
-                return;
-            }
-            let dst_pitch = u64::from(dst.footprint.row_pitch);
-            if lines > 1 && dst_pitch < row_bytes {
-                return;
-            }
-            let Some(target) = buffer_range(dst.resource, dst.footprint.offset, total) else {
-                return;
-            };
-            let Ok(row_bytes_u32) = u32::try_from(row_bytes) else {
-                return;
-            };
-            // D3D12 requires placed footprints' row pitch to be 256-byte aligned.
-            let Some(host_pitch) = dst
-                .footprint
-                .row_pitch
-                .max(row_bytes_u32)
-                .checked_next_multiple_of(256)
-            else {
-                return;
-            };
-            let Some(staging_bytes) = u64::from(host_pitch)
-                .checked_mul(lines - 1)
-                .and_then(|n| n.checked_add(row_bytes))
-            else {
-                return;
-            };
-            let Some((buffer, staging)) = list.readback(host, staging_bytes) else {
-                return;
-            };
-            if crate::texture::title_written(from_tex) {
-                crate::texture::upload(&list, src.resource, from_tex);
-            }
-            ensure_state(&list, src.resource, COPY_SOURCE);
-            let mut to_location = dst;
-            to_location.resource = buffer.as_raw().cast_const().cast();
-            to_location.footprint.offset = 0;
-            to_location.footprint.format = host_format;
-            to_location.footprint.row_pitch = host_pitch;
-            let mut from_location = src;
-            from_location.resource = from_tex.as_raw().cast_const().cast();
-            #[cfg(feature = "diagnostics")]
-            list.note_op(|| {
-                // SAFETY: a live texture; the box is the title's or null.
-                let (d, b) = unsafe { (from_tex.GetDesc(), host_box.map(|b| *b)) };
-                format!(
-                    "readback to {:?} footprint {:?} at {x},{y},{z} from {:?} {}x{} f{} sub {} box {b:?}",
-                    dst.resource,
-                    dst.footprint,
-                    src.resource,
-                    d.Width,
-                    d.Height,
-                    d.Format.0,
-                    src.kind,
-                )
-            });
-            // SAFETY: an open list; both locations in the host's layout, naming
-            // live resources; the box is the title's (same layout).
-            unsafe {
-                list.list.CopyTextureRegion(
-                    (&raw const to_location).cast(),
-                    x,
-                    y,
-                    z,
-                    (&raw const from_location).cast(),
-                    host_box,
-                )
-            };
-            // The GPU only populated the copied rectangle in staging. Preserve
-            // the rest of each destination row and the gaps between slices.
-            for slice in 0..u64::from(depth) {
-                let row = first_row + slice * rows_per_slice;
-                let dst_offset = (row * dst_pitch + column_bytes) as usize;
-                let src_offset = (row * u64::from(host_pitch) + column_bytes) as usize;
-                list.defer_readback(
-                    target.wrapping_add(dst_offset),
-                    staging.wrapping_add(src_offset),
-                    dst_pitch as usize,
-                    host_pitch as usize,
-                    copy_rows as usize,
-                    copy_bytes as usize,
-                );
-            }
-            return;
-        }
         let Some(to) = crate::resource::host_resource(dst.resource) else {
             // Texture to buffer: a read back. The list copies the texels
             // into a host buffer of ours; once it has run they go to the
@@ -1198,9 +986,9 @@ extern "system" fn copy_texture_region(
             };
             list.twin_use(src.resource, false, false);
             if crate::texture::title_written(texture) {
-                crate::texture::upload(&list, src.resource, texture);
+                crate::texture::upload(list, src.resource, texture);
             }
-            ensure_state(&list, src.resource, COPY_SOURCE);
+            ensure_state(list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
         }
         // A depth texture shaders also write: what they wrote, first (the
@@ -1210,6 +998,7 @@ extern "system" fn copy_texture_region(
         crate::texture::host_written(dst.resource);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
+        let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
         {
             let text = || {
@@ -1232,6 +1021,8 @@ extern "system" fn copy_texture_region(
                 None => list.note_op(text),
             }
         }
+        const _: () =
+            assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
         // SAFETY: an open list; both locations in the host's layout, naming
         // live resources; the box is the title's (same layout).
         unsafe {
@@ -1400,154 +1191,6 @@ pub(crate) struct Rect {
     top: i32,
     right: i32,
     bottom: i32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct DiscardRegion {
-    num_rects: u32,
-    rects: *const Rect,
-    first_subresource: u32,
-    num_subresources: u32,
-}
-
-#[cfg(windows)]
-const _: () = {
-    use windows::Win32::Foundation::RECT;
-    use windows::Win32::Graphics::Direct3D12::D3D12_DISCARD_REGION;
-    assert!(size_of::<DiscardRegion>() == size_of::<D3D12_DISCARD_REGION>());
-    assert!(align_of::<DiscardRegion>() == align_of::<D3D12_DISCARD_REGION>());
-    assert!(size_of::<Rect>() == size_of::<RECT>());
-    assert!(align_of::<Rect>() == align_of::<RECT>());
-};
-
-/// A non-null, aligned rectangle pointer must cover `num_rects` rectangles.
-#[cfg(any(windows, test))]
-unsafe fn valid_discard_region(
-    region: Option<&DiscardRegion>,
-    dimension: u32,
-    mip_levels: u16,
-    depth_or_array_size: u16,
-    planes: u8,
-    extent: [u64; 2],
-) -> bool {
-    const TEXTURE_2D: u32 = 3;
-    const TEXTURE_3D: u32 = 4;
-    let Some(region) = region else { return true };
-    let mips = u64::from(mip_levels.max(1));
-    let slices = if dimension == TEXTURE_3D {
-        1
-    } else {
-        u64::from(depth_or_array_size.max(1))
-    };
-    let first = u64::from(region.first_subresource);
-    let count = u64::from(region.num_subresources);
-    if count == 0 || first + count > mips * slices * u64::from(planes) {
-        return false;
-    }
-    if region.num_rects == 0 {
-        return true;
-    }
-    let rects = region.num_rects as usize;
-    // Rectangles apply to 2D subresources of the same dimensions. In a
-    // contiguous range with multiple mips, adjacent subresources differ.
-    if dimension != TEXTURE_2D
-        || (mips > 1 && count > 1)
-        || region.rects.is_null()
-        || !region.rects.is_aligned()
-        || rects > isize::MAX as usize / size_of::<Rect>()
-    {
-        return false;
-    }
-    let [width, height] =
-        extent.map(|size| size.checked_shr((first % mips) as u32).unwrap_or(0).max(1));
-    // SAFETY: the caller supplies the array, and its pointer and size were checked.
-    unsafe { std::slice::from_raw_parts(region.rects, rects) }
-        .iter()
-        .all(|r| {
-            r.left >= 0
-                && r.top >= 0
-                && r.left < r.right
-                && r.top < r.bottom
-                && r.right as u64 <= width
-                && r.bottom as u64 <= height
-        })
-}
-
-#[cfg(any(windows, test))]
-fn discard_state_allowed(state: u32, flags: u32) -> bool {
-    let required_flag = match state {
-        0x4 => 0x1,  // RENDER_TARGET
-        0x10 => 0x2, // DEPTH_WRITE / ALLOW_DEPTH_STENCIL
-        0x8 => 0x4,  // UNORDERED_ACCESS
-        _ => return false,
-    };
-    flags & required_flag != 0
-}
-
-extern "system" fn discard_resource(this: This, resource: This, region: *const DiscardRegion) {
-    #[cfg(windows)]
-    {
-        use windows::Win32::Graphics::Direct3D12::*;
-        let (Some(list), Some(copy)) = (host_list(this), crate::resource::host_copy(resource))
-        else {
-            return;
-        };
-        let Some(state) = list.tracked_texture_state(&copy) else {
-            return;
-        };
-        // SAFETY: a live host texture.
-        let desc = unsafe { copy.texture.GetDesc() };
-        if !discard_state_allowed(state, desc.Flags.0 as u32) || !region.is_aligned() {
-            return;
-        }
-        // SAFETY: the title passes a discard region or null.
-        let region = unsafe { region.as_ref() };
-        if let Some(region) = region {
-            let Some(host) = crate::host::host() else {
-                return;
-            };
-            let mut format = D3D12_FEATURE_DATA_FORMAT_INFO {
-                Format: desc.Format,
-                PlaneCount: 0,
-            };
-            // SAFETY: the feature data matches the requested query.
-            if unsafe {
-                host.device.CheckFeatureSupport(
-                    D3D12_FEATURE_FORMAT_INFO,
-                    (&raw mut format).cast(),
-                    size_of::<D3D12_FEATURE_DATA_FORMAT_INFO>() as u32,
-                )
-            }
-            .is_err()
-            {
-                return;
-            }
-            // SAFETY: the title supplies the rectangles described by the region.
-            if !unsafe {
-                valid_discard_region(
-                    Some(region),
-                    desc.Dimension.0 as u32,
-                    desc.MipLevels,
-                    desc.DepthOrArraySize,
-                    format.PlaneCount,
-                    [desc.Width, u64::from(desc.Height)],
-                )
-            } {
-                return;
-            }
-        }
-        #[cfg(feature = "diagnostics")]
-        list.note_op(|| format!("discard resource {resource:?}"));
-        // SAFETY: the list holds the texture in a compatible state. The
-        // checked region and its rectangles have the host layout.
-        unsafe {
-            list.list
-                .DiscardResource(&copy.texture, region.map(|r| std::ptr::from_ref(r).cast()))
-        };
-    }
-    #[cfg(not(windows))]
-    let _ = (this, resource, region);
 }
 
 extern "system" fn clear_rtv(
@@ -1946,33 +1589,19 @@ mod state {
         super::count_dispatch();
         with_state(this, |list, s| s.dispatch(list, x, y, z));
     }
-    /// The groups a mesh dispatch of `x` × `y` × `z` groups runs: the
-    /// title's mesh programs read only the x group id, so `x` (y and z
-    /// other than 1 are logged once); none if any dimension is empty.
-    pub(super) fn mesh_groups(x: u32, y: u32, z: u32) -> Option<u32> {
-        if x == 0 || y == 0 || z == 0 {
-            return None;
-        }
-        if y != 1 || z != 1 {
+    /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
+    /// programs take `x` groups only.
+    pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
+        super::count_draw();
+        if y * z != 1 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
         }
-        Some(x)
+        with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
-    /// `DispatchMesh(x, y, z)` (the PC method of List6).
-    pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
-        super::count_draw();
-        if let Some(x) = mesh_groups(x, y, z) {
-            with_state(this, |list, s| s.dispatch_mesh(list, x));
-        }
-    }
-    /// `DispatchMeshX(x, flags, indirect arguments, payload)`. With an
-    /// indirect address the group counts are in GPU memory there, run as
-    /// indirect execution of one mesh dispatch.
-    /// Inferred, not documented: the arguments are those of a PC indirect
-    /// mesh dispatch (D3D12_DISPATCH_MESH_ARGUMENTS, three 32-bit group
-    /// counts, as the title's mesh dispatch signatures have) and `x` is then
-    /// unused; `flags` and `payload` are unknown.
+    /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
+    /// shortcut: dispatches whose group count is in GPU memory (indirect)
+    /// are dropped; make them ExecuteIndirect when the title uses them.
     pub(super) extern "system" fn dispatch_mesh_x(
         this: This,
         x: u32,
@@ -1980,22 +1609,13 @@ mod state {
         indirect: u64,
         _payload: u64,
     ) {
-        const MESH: u32 = 10;
-        const STRIDE: u32 = 12;
         super::count_draw();
-        if indirect == 0 {
-            if x != 0 {
-                with_state(this, |list, s| s.dispatch_mesh(list, x));
-            }
+        if indirect != 0 {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
             return;
         }
-        let mut ran = false;
-        with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (MESH, STRIDE, 1), indirect, None);
-        });
-        if !ran {
-            super::INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
+        with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
     pub(super) extern "system" fn draw_indexed(
         this: This,
@@ -2426,15 +2046,15 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
         return;
     }
     let _ = this;
-    // Without a host GPU nothing runs later: write now (no lock held).
-    what.write(address as *mut u8, bytes).run();
+    // Without a host GPU nothing runs later: write now.
+    what.write(address as *mut u8, bytes);
 }
 
 /// The list methods by their slot in older titles' lists (the 2020-era
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 53] = [
+const METHODS: [(usize, *const ()); 52] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
@@ -2475,7 +2095,6 @@ const METHODS: [(usize, *const ()); 53] = [
     (50, state::targets as *const ()),            // 0x190
     (51, clear_dsv as *const ()),                 // 0x198
     (52, clear_rtv as *const ()),                 // 0x1a0
-    (55, discard_resource as *const ()),          // 0x1b8
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
     (68, depth_bounds as *const ()),              // 0x220 depth bounds
@@ -2555,421 +2174,6 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-    use tracing::{Event, Metadata, Subscriber, span};
-
-    struct PipelineBinds(Arc<AtomicUsize>);
-
-    impl Subscriber for PipelineBinds {
-        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-            metadata.is_event()
-                && metadata.target() == "victory_gpu::pipeline"
-                && metadata.fields().field("pipeline").is_some()
-                && metadata.fields().field("frame").is_some()
-        }
-
-        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
-            unreachable!()
-        }
-
-        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
-        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
-        fn enter(&self, _: &span::Id) {}
-        fn exit(&self, _: &span::Id) {}
-
-        fn event(&self, event: &Event<'_>) {
-            if self.enabled(event.metadata()) {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-
-    #[test]
-    fn lists_bind_the_initial_pipeline_on_creation() {
-        use crate::pipeline::{ComputeHead, create_compute};
-
-        // A synthetic compute description matching the public ABI.
-        #[repr(C)]
-        struct ComputeDesc {
-            root: This,
-            code: *const u8,
-            size: usize,
-        }
-
-        let null = std::ptr::null();
-        let mut allocator = null;
-        assert_eq!(
-            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
-            S_OK
-        );
-        let desc = ListDesc {
-            kind: 0,
-            flags: 0,
-            nodes: 0,
-            barrier_batch: 0,
-        };
-        let bytes = [0xa5, 0xb6, 0xc7];
-        let compute = ComputeDesc {
-            root: null,
-            code: bytes.as_ptr(),
-            size: bytes.len(),
-        };
-        let compute = std::ptr::from_ref(&compute).cast::<ComputeHead>();
-        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
-        let binds = Arc::new(AtomicUsize::new(0));
-        let subscriber = tracing::Dispatch::new(PipelineBinds(binds.clone()));
-
-        tracing::dispatcher::with_default(&subscriber, || {
-            for console in [false, true] {
-                let create = |pipeline, out| {
-                    if console {
-                        create_list_x(null, &desc, allocator, pipeline, &LIST_IIDS[1], out)
-                    } else {
-                        create_list(null, 0, 0, allocator, pipeline, &LIST_IIDS[1], out)
-                    }
-                };
-                let mut pipeline = null;
-                let mut list = null;
-                assert_eq!(
-                    create_compute(null, compute, &PAGEABLE_IIDS[0], &mut pipeline),
-                    S_OK
-                );
-                let before = binds.load(Ordering::Relaxed);
-
-                assert_eq!(create(null, &mut list), S_OK);
-                assert_eq!(binds.load(Ordering::Relaxed), before);
-                assert_eq!(release(list), 0);
-
-                assert_eq!(create(pipeline, &mut list), S_OK);
-                assert_eq!(binds.load(Ordering::Relaxed), before + 1);
-                assert_eq!(release(list), 0);
-                assert_eq!(release(pipeline), 0);
-            }
-        });
-        assert_eq!(release(allocator), 0);
-    }
-
-    /// Mesh programs read only the x group id, so a mesh dispatch runs its
-    /// x groups; one with no groups in any dimension runs nothing.
-    #[cfg(windows)]
-    #[test]
-    fn mesh_dispatches_run_x_groups_unless_empty() {
-        use state::mesh_groups;
-        assert_eq!(mesh_groups(5, 1, 1), Some(5));
-        assert_eq!(mesh_groups(0, 1, 1), None);
-        assert_eq!(mesh_groups(5, 0, 1), None);
-        assert_eq!(mesh_groups(5, 1, 0), None);
-        assert_eq!(mesh_groups(5, 2, 3), Some(5));
-        assert_eq!(mesh_groups(5, u32::MAX, u32::MAX), Some(5));
-    }
-
-    /// An indirect mesh dispatch the host does not run (no host device, as
-    /// in tests) is counted with the other indirect work dropped.
-    #[cfg(windows)]
-    #[test]
-    fn indirect_mesh_dispatches_not_run_are_counted() {
-        let null = std::ptr::null();
-        let mut allocator = null;
-        assert_eq!(
-            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
-            S_OK
-        );
-        let mut list = null;
-        let hr = create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list);
-        assert_eq!(hr, S_OK);
-        let arguments = [7u32, 1, 1];
-        let before = INDIRECT.load(std::sync::atomic::Ordering::Relaxed);
-        state::dispatch_mesh_x(list, 0, 0, arguments.as_ptr() as u64, 0);
-        assert!(INDIRECT.load(std::sync::atomic::Ordering::Relaxed) > before);
-        assert_eq!(close(list), S_OK);
-        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
-        assert_eq!(release(list), 0);
-        assert_eq!(release(allocator), 0);
-    }
-
-    #[test]
-    fn discard_resource_slot_is_stable() {
-        assert_eq!(LIST_FUNCTIONS.0[55], discard_resource as *const ());
-        assert_eq!(NEWER_LIST_FUNCTIONS.0[55], discard_resource as *const ());
-    }
-
-    #[test]
-    fn discard_region_validation() {
-        let rect = Rect {
-            left: 1,
-            top: 1,
-            right: 4,
-            bottom: 4,
-        };
-        let valid = DiscardRegion {
-            num_rects: 1,
-            rects: &rect,
-            first_subresource: 1,
-            num_subresources: 1,
-        };
-        let whole_subresource = DiscardRegion {
-            num_rects: 0,
-            rects: std::ptr::null(),
-            ..valid
-        };
-        let check = |region: Option<&DiscardRegion>, dimension, mips, slices, planes| {
-            // SAFETY: each non-null rectangle pointer names one live rectangle.
-            unsafe { valid_discard_region(region, dimension, mips, slices, planes, [8, 8]) }
-        };
-        assert!(check(None, 3, 2, 3, 1));
-        assert!(check(Some(&valid), 3, 2, 3, 1));
-        assert!(!check(Some(&valid), 2, 2, 3, 1)); // 1D subresources
-        assert!(!check(Some(&valid), 4, 2, 3, 1)); // 3D subresources
-        assert!(check(Some(&whole_subresource), 4, 2, 3, 1));
-        assert!(check(Some(&whole_subresource), 3, 1, 1, 2)); // stencil plane
-        assert!(!check(Some(&whole_subresource), 3, 1, 1, 1));
-
-        for (first, count) in [(5, 2), (6, 1), (u32::MAX, 2), (1, u32::MAX), (1, 0)] {
-            let bad_range = DiscardRegion {
-                first_subresource: first,
-                num_subresources: count,
-                ..whole_subresource
-            };
-            assert!(!check(Some(&bad_range), 3, 2, 3, 1));
-        }
-        let last_slice = DiscardRegion {
-            first_subresource: 5,
-            ..whole_subresource
-        };
-        assert!(check(Some(&last_slice), 3, 2, 3, 1));
-        assert!(!check(Some(&last_slice), 4, 2, 3, 1)); // depth is not an array size
-
-        let null_rects = DiscardRegion {
-            rects: std::ptr::null(),
-            ..valid
-        };
-        assert!(!check(Some(&null_rects), 3, 2, 3, 1));
-        let different_mips = DiscardRegion {
-            num_subresources: 2,
-            ..valid
-        };
-        assert!(!check(Some(&different_mips), 3, 2, 3, 1));
-        assert!(check(Some(&different_mips), 3, 1, 3, 1));
-        for right in [0, 1, 5] {
-            let rect = Rect { right, ..rect };
-            let bad_rect = DiscardRegion {
-                rects: &rect,
-                ..valid
-            };
-            assert!(!check(Some(&bad_rect), 3, 2, 3, 1));
-        }
-    }
-
-    #[test]
-    fn discard_requires_matching_state_and_flags() {
-        for (state, flag) in [(0x4, 1), (0x10, 2), (0x8, 4)] {
-            assert!(discard_state_allowed(state, flag));
-            assert!(discard_state_allowed(state, flag | 0x20)); // simultaneous access
-            assert!(!discard_state_allowed(state, 0x7 ^ flag));
-            assert!(!discard_state_allowed(state | 0x80, flag));
-        }
-        for state in [0, 0x400, 0x80] {
-            assert!(!discard_state_allowed(state, 0x7));
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn discard_resource_executes_on_guest_queue() {
-        use windows::Win32::Graphics::Direct3D12::*;
-        use windows::Win32::Graphics::Dxgi::Common::*;
-        use windows::Win32::Graphics::Dxgi::{
-            CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
-        };
-
-        let Some(host) = crate::host::host() else {
-            eprintln!("skipped live discard: no host D3D12 device");
-            return;
-        };
-        // SAFETY: plain DXGI queries for the device the guest queue uses.
-        unsafe {
-            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
-            let adapter: IDXGIAdapter1 = factory
-                .EnumAdapterByLuid(host.device.GetAdapterLuid())
-                .unwrap();
-            let desc = adapter.GetDesc1().unwrap();
-            let name = String::from_utf16_lossy(&desc.Description);
-            eprintln!("live discard adapter: {}", name.trim_end_matches('\0'));
-        }
-
-        let null = std::ptr::null();
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_DEFAULT,
-            ..Default::default()
-        };
-        let resource_iid = guid(
-            0x696442be,
-            0xa72e,
-            0x4059,
-            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
-        );
-        let make_resource = |desc: D3D12_RESOURCE_DESC| {
-            let mut resource = null;
-            assert_eq!(
-                crate::resource::create_committed(
-                    null,
-                    (&raw const heap).cast(),
-                    0,
-                    (&raw const desc).cast(),
-                    0,
-                    null.cast(),
-                    &resource_iid,
-                    &mut resource,
-                ),
-                S_OK
-            );
-            resource
-        };
-        let make_texture = |format, flags| {
-            let resource = make_resource(D3D12_RESOURCE_DESC {
-                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-                Width: 8,
-                Height: 8,
-                DepthOrArraySize: 1,
-                MipLevels: 1,
-                Format: format,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Flags: flags,
-                ..Default::default()
-            });
-            assert!(
-                crate::resource::host_resource(resource).is_some(),
-                "missing host texture for {format:?}"
-            );
-            resource
-        };
-        let rt = make_texture(
-            DXGI_FORMAT_R8G8B8A8_UNORM,
-            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-        );
-        let ds = make_texture(
-            DXGI_FORMAT_D24_UNORM_S8_UINT,
-            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
-        );
-        let uav = make_texture(
-            DXGI_FORMAT_R32_UINT,
-            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-        );
-        let srv = make_texture(DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE);
-        let buffer = make_resource(D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: 256,
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            ..Default::default()
-        });
-        assert!(crate::resource::buffer_bytes(buffer).is_some());
-
-        let (mut queue, mut allocator, mut list) = (null, null, null);
-        let queue_iid = guid(
-            0x0ec870a6,
-            0x5d7e,
-            0x4c22,
-            [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
-        );
-        let queue_desc = [0_u32; 4];
-        assert_eq!(
-            crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
-            S_OK
-        );
-        assert_eq!(
-            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
-            S_OK
-        );
-        assert_eq!(
-            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
-            S_OK
-        );
-        let host_list = host_list(list).unwrap();
-        let discard = slot::<extern "system" fn(This, This, *const DiscardRegion)>(list, 0x1b8);
-        discard(list, null, null.cast());
-        discard(list, buffer, null.cast());
-        ensure_state(
-            &host_list,
-            srv,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32,
-        );
-        discard(list, srv, null.cast());
-        discard(list, rt, null.cast()); // no state established by this list yet
-
-        ensure_state(&host_list, rt, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
-        discard(list, rt, null.cast());
-        let rect = Rect {
-            left: 1,
-            top: 2,
-            right: 5,
-            bottom: 6,
-        };
-        discard(
-            list,
-            rt,
-            &DiscardRegion {
-                num_rects: 1,
-                rects: &rect,
-                first_subresource: 0,
-                num_subresources: 1,
-            },
-        );
-        let mut descriptor = [0_u64; 14];
-        let handle = descriptor.as_mut_ptr() as u64;
-        crate::descriptor::create_rtv(null, rt, std::ptr::null(), handle);
-        let clear =
-            slot::<extern "system" fn(This, u64, *const [f32; 4], u32, *const Rect)>(list, 0x1a0);
-        clear(list, handle, &[0.25, 0.5, 0.75, 1.0], 0, std::ptr::null());
-
-        ensure_state(&host_list, ds, D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32);
-        for first_subresource in [0, 1] {
-            discard(
-                list,
-                ds,
-                &DiscardRegion {
-                    num_rects: 0,
-                    rects: std::ptr::null(),
-                    first_subresource,
-                    num_subresources: 1,
-                },
-            );
-        }
-        ensure_state(
-            &host_list,
-            uav,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32,
-        );
-        discard(list, uav, null.cast());
-
-        assert_eq!(
-            slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
-            S_OK
-        );
-        assert_eq!(host.log_messages(), None);
-        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
-        // SAFETY: the guest queue waits for submission and the device is live.
-        unsafe { host.device.GetDeviceRemovedReason().unwrap() };
-
-        for object in [list, allocator, queue, rt, ds, uav, srv, buffer] {
-            assert_eq!(
-                slot::<extern "system" fn(This) -> u32>(object, 0x10)(object),
-                0
-            );
-        }
-    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {
@@ -3011,109 +2215,5 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
-    }
-
-    /// Resetting or dropping a list whose submission is held behind a fence
-    /// wait keeps its upload blocks alive until the submission runs, and
-    /// recycles the detached host list back into the host's pool.
-    #[cfg(windows)]
-    #[test]
-    fn pending_list_reset_and_drop_keep_uploads_and_recycle_host_list() {
-        use windows::core::Interface;
-
-        let Some(host) = crate::host::host() else {
-            return;
-        };
-        type Sync = extern "system" fn(This, This, u64) -> HRESULT;
-        type Execute = extern "system" fn(This, u32, *const This);
-        let null = std::ptr::null();
-        let (waits, sig_slot) = crate::queue::test_queue();
-        let wait = slot::<Sync>(waits, sig_slot + 8);
-        let signal = slot::<Sync>(waits, sig_slot);
-        let execute = slot::<Execute>(waits, 0x50);
-        let completed = |f: This| slot::<extern "system" fn(This) -> u64>(f, 0x40)(f);
-        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
-
-        let fence_iid = &crate::fence::FENCE_IIDS[0];
-        let (mut ready, mut done) = (null, null);
-        assert_eq!(
-            crate::fence::create(null, 0, 0, fence_iid, &mut ready),
-            S_OK
-        );
-        assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut done), S_OK);
-
-        let mut allocator = null;
-        assert_eq!(
-            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
-            S_OK
-        );
-        let mut list = null;
-        assert_eq!(
-            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
-            S_OK
-        );
-
-        // Hold the queue, record a copy from list upload memory, submit, then
-        // reset the list while its submission is still waiting.
-        assert_eq!(wait(waits, ready, 1), S_OK);
-        let src1 = allocate_upload(list, 64, 16);
-        assert!(!src1.is_null());
-        // SAFETY: 64 bytes handed out above.
-        unsafe { src1.write_bytes(0x3c, 64) };
-        let mut dst1 = [0u8; 64];
-        copy_memory(list, dst1.as_mut_ptr() as u64, src1 as u64, 64, 0);
-        assert_eq!(close(list), S_OK);
-        let raw1 = host_list(list).unwrap().list.as_raw() as usize;
-        execute(waits, 1, &list);
-        assert_eq!(signal(waits, done, 1), S_OK);
-        assert_eq!(reset(list, allocator, null), S_OK);
-        let raw2 = host_list(list).unwrap().list.as_raw() as usize;
-        assert_ne!(raw2, raw1, "reset must detach from the pending host list");
-        assert_eq!(dst1, [0u8; 64]);
-
-        let reused_before = host.reused_lists();
-        assert_eq!(crate::fence::signal(ready, 1), S_OK);
-        assert_eq!(completed(done), 1);
-        assert_eq!(dst1, [0x3c; 64], "kept upload memory reached the copy");
-
-        // Now hold behind ready == 2: reset `list` again (reusing a pooled
-        // host list) and also drop a second list while its submission waits.
-        assert_eq!(wait(waits, ready, 2), S_OK);
-        assert_eq!(close(list), S_OK);
-        execute(waits, 1, &list);
-        assert_eq!(reset(list, allocator, null), S_OK);
-        assert!(
-            host.reused_lists() > reused_before,
-            "detached host list should be recycled from the pool"
-        );
-
-        let mut list2 = null;
-        assert_eq!(
-            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list2),
-            S_OK
-        );
-        let src2 = allocate_upload(list2, 64, 16);
-        assert!(!src2.is_null());
-        // SAFETY: 64 bytes handed out above.
-        unsafe { src2.write_bytes(0x5a, 64) };
-        let mut dst2 = [0u8; 64];
-        copy_memory(list2, dst2.as_mut_ptr() as u64, src2 as u64, 64, 0);
-        assert_eq!(close(list2), S_OK);
-        execute(waits, 1, &list2);
-        assert_eq!(signal(waits, done, 2), S_OK);
-        // Drop `list2` while its submission is still held back.
-        assert_eq!(release(list2), 0);
-        assert_eq!(dst2, [0u8; 64]);
-
-        assert_eq!(crate::fence::signal(ready, 2), S_OK);
-        assert_eq!(completed(done), 2);
-        assert_eq!(
-            dst2, [0x5a; 64],
-            "dropping a pending list must keep its upload memory until run"
-        );
-
-        for object in [list, allocator, waits, ready, done] {
-            assert_eq!(release(object), 0);
-        }
     }
 }

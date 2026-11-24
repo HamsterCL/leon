@@ -56,16 +56,12 @@ pub struct Instruction {
     pub opcode: u16,
     /// Every dword of the instruction, including literals and extra dwords.
     pub words: Vec<u32>,
-    /// [`name`] of `encoding` and `opcode`, resolved once at decode time.
-    /// The translator asks about every instruction eight times; the table is
-    /// a binary search.
-    name: Option<&'static str>,
 }
 
 impl Instruction {
     /// AMD's name for the opcode, if it is in our table.
     pub fn name(&self) -> Option<&'static str> {
-        self.name
+        name(self.encoding, self.opcode)
     }
 }
 
@@ -286,13 +282,11 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
             _ => return Err(isa(offset, "unknown encoding")),
         }
     };
-    let opcode = opcode as u16;
     Ok(Instruction {
         offset,
         encoding,
-        opcode,
+        opcode: opcode as u16,
         words: (0..len).map(word).collect::<Result<_, _>>()?,
-        name: name(encoding, opcode),
     })
 }
 
@@ -330,35 +324,6 @@ fn name(encoding: Encoding, opcode: u16) -> Option<&'static str> {
         .binary_search_by_key(&op, |&(o, _)| o)
         .ok()
         .map(|i| table[i].1)
-}
-
-/// The opcodes of an encoding (for VOP3, only the VOP3-only ones), for
-/// tests that assemble programs.
-#[cfg(test)]
-pub(crate) fn opcodes(encoding: Encoding) -> &'static [(u16, &'static str)] {
-    use opcodes as t;
-    match encoding {
-        Encoding::Sop2 => t::SOP2,
-        Encoding::Sopk => t::SOPK,
-        Encoding::Sop1 => t::SOP1,
-        Encoding::Sopc => t::SOPC,
-        Encoding::Sopp => t::SOPP,
-        Encoding::Smem => t::SMEM,
-        Encoding::Vop2 => t::VOP2,
-        Encoding::Vop1 => t::VOP1,
-        Encoding::Vopc => t::VOPC,
-        Encoding::Vop3 => t::VOP3,
-        Encoding::Vop3p => t::VOP3P,
-        Encoding::Vintrp => t::VINTRP,
-        Encoding::Ds => t::DS,
-        Encoding::Mubuf => t::MUBUF,
-        Encoding::Mtbuf => t::MTBUF,
-        Encoding::Mimg => t::MIMG,
-        Encoding::Exp => &[],
-        Encoding::Flat => t::FLAT,
-        Encoding::Global => t::GLOBAL,
-        Encoding::Scratch => t::SCRATCH,
-    }
 }
 
 fn isa(offset: usize, reason: &'static str) -> ShaderError {
@@ -508,18 +473,6 @@ mod tests {
                 (24, "s_setpc_b64"),
             ]
         );
-    }
-
-    /// RDNA2 (GFX10.3) has the fused legacy multiply-adds at these
-    /// opcodes: LLVM's gfx1030 assembler tests encode
-    /// `v_fma_legacy_f32 v0, v1, v2, v3` and `v_fmac_legacy_f32_e32 v0,
-    /// v1, v2` as these words.
-    #[test]
-    fn legacy_multiply_adds_are_the_fused_ones() {
-        let fma = summary(&[0xD540_0000, 0x040E_0501, S_ENDPGM]);
-        assert_eq!(fma[0].2, "v_fma_legacy_f32");
-        let fmac = summary(&[0x0C00_0501, S_ENDPGM]);
-        assert_eq!(fmac[0].2, "v_fmac_legacy_f32");
     }
 
     #[test]

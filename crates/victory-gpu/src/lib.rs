@@ -20,13 +20,6 @@ mod capture;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
-/// Diagnostics: counters raised by this crate's callers (the title's page
-/// scatters), which ride the frame line with the copy statistics.
-#[cfg(all(windows, feature = "diagnostics"))]
-pub mod stats {
-    pub use super::copystat::{C, add};
-}
-
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
@@ -42,15 +35,11 @@ mod indirect;
 mod inplace;
 pub mod list;
 pub mod object;
-#[cfg(windows)]
-mod overlay;
 pub mod pipeline;
 #[cfg(windows)]
 mod primitive;
 pub mod query;
 pub mod queue;
-#[cfg(windows)]
-mod rectangles;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -64,7 +53,6 @@ mod shadow;
 pub mod signature;
 #[cfg(windows)]
 mod texture;
-mod timeline;
 #[cfg(windows)]
 mod watch;
 

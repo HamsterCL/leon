@@ -651,13 +651,11 @@ dependencies = [
  "blake3",
  "clap",
  "memchr",
- "tempfile",
  "victory-core",
  "victory-game",
  "victory-hle",
  "victory-loader",
  "victory-pe",
- "victory-profile",
  "victory-shader",
  "walkdir",
 ]
@@ -685,7 +683,6 @@ version = "0.1.0"
 dependencies = [
  "memchr",
  "miniz_oxide",
- "victory-shader",
 ]
 
 [[package]]
@@ -699,7 +696,6 @@ dependencies = [
  "tracing",
  "victory-formats",
  "victory-pipeline",
- "victory-profile",
  "victory-shader",
  "windows",
  "windows-sys",
@@ -770,9 +766,7 @@ dependencies = [
 name = "victory-shader"
 version = "0.1.0"
 dependencies = [
- "memchr",
  "miniz_oxide",
- "tempfile",
  "thiserror",
  "windows",
  "windows-sys",

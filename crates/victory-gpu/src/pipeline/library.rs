@@ -425,51 +425,6 @@ fn one_call() -> Option<MutexGuard<'static, ()>> {
         .then(|| CALLING.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-/// Names one thread at a time holds.
-struct Names {
-    held: Mutex<Option<HashSet<String>>>,
-    released: Condvar,
-}
-
-/// A name held until this is dropped.
-struct Held<'a> {
-    names: &'a Names,
-    name: &'a str,
-}
-
-impl Names {
-    const fn new() -> Names {
-        Names {
-            held: Mutex::new(None),
-            released: Condvar::new(),
-        }
-    }
-
-    /// Holds `name`, once no other thread does.
-    fn hold<'a>(&'a self, name: &'a str) -> Held<'a> {
-        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
-        while held.as_ref().is_some_and(|h| h.contains(name)) {
-            held = self.released.wait(held).unwrap_or_else(|e| e.into_inner());
-        }
-        held.get_or_insert_default().insert(name.to_owned());
-        Held { names: self, name }
-    }
-}
-
-impl Drop for Held<'_> {
-    fn drop(&mut self) {
-        let mut held = self.names.held.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(h) = held.as_mut() {
-            h.remove(self.name);
-        }
-        drop(held);
-        self.names.released.notify_all();
-    }
-}
-
-/// Pipelines being loaded, or made and stored.
-static NAMES: Names = Names::new();
-
 const LIBRARY_FILE: &str = "host-pipelines.bin";
 /// A saved library that could not replace [`LIBRARY_FILE`] while this run
 /// had it mapped (a system that refuses to replace a mapped file): the next
@@ -550,9 +505,7 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 }
 
 /// The pipeline named `name`: loaded from the library by `load` if it is
-/// there with the same description, else made by `create` and stored. A
-/// name asked for by several threads is loaded or made by one at a time
-/// (the others then find it in the library); different names overlap.
+/// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
     name: &str,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
@@ -611,14 +564,15 @@ pub(crate) fn pipeline(
 /// Writes the library and the early list if pipelines were added since the
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
-    // Held over serialisation and both writes, so overlapping saves cannot
-    // replace files under each other.
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
-    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-    if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
-        return;
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
     }
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(error = %e, "host pipeline library not saved");
@@ -653,7 +607,6 @@ pub(crate) fn save(now: bool) {
             size
         }
     };
-    let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
     let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
@@ -717,18 +670,9 @@ fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Res
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
 /// `path`: a reader never sees a part.
 fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let extension = format!(
-        "tmp-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    );
-    let tmp = path.with_extension(extension);
-    let written = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    written
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// Title pipeline keys requested by draws or dispatches (this run and the last).
@@ -777,167 +721,6 @@ mod tests {
         assert_ne!(a, name("mesh", b"root", &[b"vs", b"ps"], "state"));
         // Parts do not run into each other.
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
-    }
-
-    #[test]
-    fn different_names_are_held_at_the_same_time() {
-        static NAMES: Names = Names::new();
-        // Each thread holds its name until every thread holds its own.
-        let all = std::sync::Barrier::new(8);
-        std::thread::scope(|s| {
-            for i in 0..8 {
-                let all = &all;
-                s.spawn(move || {
-                    let name = format!("pipeline {i}");
-                    let _held = NAMES.hold(&name);
-                    all.wait();
-                });
-            }
-        });
-        assert!(NAMES.held.lock().unwrap().as_ref().unwrap().is_empty());
-    }
-
-    #[test]
-    fn one_name_is_held_by_one_thread_at_a_time() {
-        static NAMES: Names = Names::new();
-        static INSIDE: AtomicU64 = AtomicU64::new(0);
-        std::thread::scope(|s| {
-            for _ in 0..8 {
-                s.spawn(|| {
-                    for _ in 0..500 {
-                        let _held = NAMES.hold("pipeline");
-                        assert_eq!(INSIDE.fetch_add(1, Ordering::SeqCst), 0);
-                        std::hint::spin_loop();
-                        INSIDE.fetch_sub(1, Ordering::SeqCst);
-                    }
-                });
-            }
-        });
-        // A holder that panics lets go of it.
-        let panicked = std::thread::spawn(|| {
-            let _held = NAMES.hold("pipeline");
-            panic!("on purpose");
-        });
-        assert!(panicked.join().is_err());
-        drop(NAMES.hold("pipeline"));
-    }
-
-    /// A library's pipelines load on many threads at once, each with its
-    /// own description (a load with another's is refused), while others are
-    /// stored and the library is serialised.
-    #[test]
-    fn pipelines_load_on_many_threads_at_once() {
-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-        use windows::core::s;
-        const N: usize = 48;
-        let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok())
-        else {
-            return; // no host GPU here
-        };
-        let shader = |i: usize| {
-            let source = format!(
-                "#define RS \"UAV(u0)\"\nRWByteAddressBuffer b : register(u0);\n\
-                 [RootSignature(RS)] [numthreads(1, 1, 1)] void main() {{ b.Store(0, b.Load(4) * {i} + {i}); }}"
-            );
-            let mut blob = None;
-            // SAFETY: the source outlives the call; the blob is read within it.
-            unsafe {
-                D3DCompile(
-                    source.as_ptr().cast(),
-                    source.len(),
-                    None,
-                    None,
-                    None,
-                    s!("main"),
-                    s!("cs_5_1"),
-                    0,
-                    0,
-                    &mut blob,
-                    None,
-                )
-                .ok()?;
-                let blob = blob?;
-                Some(
-                    std::slice::from_raw_parts(
-                        blob.GetBufferPointer().cast::<u8>(),
-                        blob.GetBufferSize(),
-                    )
-                    .to_vec(),
-                )
-            }
-        };
-        let Some(codes) = (0..2 * N).map(shader).collect::<Option<Vec<_>>>() else {
-            return; // no shader compiler here
-        };
-        // SAFETY: the code holds its root signature.
-        let root: ID3D12RootSignature =
-            unsafe { device.CreateRootSignature(0, &codes[0]) }.unwrap();
-        struct Shared(ID3D12Device1, ID3D12RootSignature, ID3D12PipelineLibrary1);
-        // SAFETY: D3D12 objects are free-threaded.
-        unsafe impl Sync for Shared {}
-        impl Shared {
-            fn desc(&self, code: &[u8]) -> D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                    // SAFETY: a borrowed pointer the description never releases.
-                    pRootSignature: unsafe { std::mem::transmute_copy(&self.1) },
-                    CS: D3D12_SHADER_BYTECODE {
-                        pShaderBytecode: code.as_ptr().cast(),
-                        BytecodeLength: code.len(),
-                    },
-                    ..Default::default()
-                }
-            }
-            fn store(&self, i: usize, code: &[u8]) {
-                let name = HSTRING::from(format!("p{i}"));
-                // SAFETY: the description points at live data.
-                unsafe {
-                    let pso: ID3D12PipelineState =
-                        self.0.CreateComputePipelineState(&self.desc(code)).unwrap();
-                    self.2.StorePipeline(&name, &pso).unwrap();
-                }
-            }
-            fn load(&self, i: usize, code: &[u8]) -> windows::core::Result<ID3D12PipelineState> {
-                let name = HSTRING::from(format!("p{i}"));
-                // SAFETY: as above.
-                unsafe { self.2.LoadComputePipeline(&name, &self.desc(code)) }
-            }
-            fn serialized(&self) -> Vec<u8> {
-                // SAFETY: a buffer of the size asked for; nothing is stored
-                // meanwhile.
-                unsafe {
-                    let mut blob = vec![0; self.2.GetSerializedSize()];
-                    self.2.Serialize(&mut blob).unwrap();
-                    blob
-                }
-            }
-        }
-        let first = open(&device, Vec::new()).expect("an empty library");
-        let made = Shared(device.clone(), root.clone(), first.library.clone());
-        (0..N).for_each(|i| made.store(i, &codes[i]));
-        let again = open(&device, made.serialized()).expect("the library again");
-        let shared = Shared(device, root, again.library.clone());
-        let stores = Mutex::new(());
-        std::thread::scope(|s| {
-            for t in 0..8 {
-                let (shared, codes, stores) = (&shared, &codes, &stores);
-                s.spawn(move || {
-                    for i in (t..N).step_by(8) {
-                        shared.load(i, &codes[i]).expect("a stored pipeline");
-                        assert!(
-                            shared.load(i, &codes[(i + 1) % N]).is_err(),
-                            "another description"
-                        );
-                        assert!(shared.load(N + i, &codes[N + i]).is_err(), "not stored yet");
-                        let _one = stores.lock().unwrap();
-                        shared.store(N + i, &codes[N + i]);
-                        shared.serialized();
-                    }
-                });
-            }
-        });
-        for (i, code) in codes.iter().enumerate() {
-            shared.load(i, code).expect("every pipeline");
-        }
     }
 
     #[test]
@@ -1051,49 +834,5 @@ mod tests {
             pattern(page * 4096, &mut expected);
             assert!(bytes == &expected[..], "page {page} of the replaced library no longer reads as the old file");
         }
-    }
-
-    #[test]
-    fn concurrent_atomic_writes_publish_one_complete_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(LIBRARY_FILE);
-        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
-        let mut threads = Vec::new();
-        for thread in 0..8 {
-            let path = path.clone();
-            let start = start.clone();
-            threads.push(std::thread::spawn(move || {
-                start.wait();
-                let byte = thread as u8 + 1;
-                for _ in 0..32 {
-                    write_atomically(&path, &[byte; 64 * 1024]).unwrap();
-                }
-            }));
-        }
-        for thread in threads {
-            thread.join().unwrap();
-        }
-
-        let published = std::fs::read(&path).unwrap();
-        assert_eq!(published.len(), 64 * 1024);
-        assert!(published.iter().all(|&byte| byte == published[0]));
-        assert!((1..=8).contains(&published[0]));
-        assert!(!std::fs::read_dir(dir.path())
-            .unwrap()
-            .flatten()
-            .any(|entry| entry.file_name().to_string_lossy().contains(".tmp-")));
-    }
-
-    #[test]
-    fn failed_atomic_writes_remove_their_temporary_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(LIBRARY_FILE);
-        std::fs::create_dir(&path).unwrap();
-
-        assert!(write_atomically(&path, b"not published").is_err());
-        assert!(!std::fs::read_dir(dir.path())
-            .unwrap()
-            .flatten()
-            .any(|entry| entry.file_name().to_string_lossy().contains(".tmp-")));
     }
 }
