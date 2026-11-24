@@ -10,8 +10,9 @@ on:
     branches: [main]
   pull_request:
 
-permissions:
-  contents: read
+# No token permissions by default; each job grants only what it uses, so a
+# job added later starts with none instead of inheriting these.
+permissions: {}
 
 # The implicit default shell is plain `bash -e`, where a failing command on
 # the left of a pipe (e.g. the `echo ... | sha256sum -c -` checksum checks)
@@ -74,11 +75,14 @@ env:
 
 jobs:
   # Each job's name repeats its id, so the check names that branch protection
-  # requires stay `linux` and `windows-target-check`; zizmor's pedantic
+  # requires stay `linux` and `windows-target-check`; zizmor's auditor
   # persona (below) flags unnamed jobs.
   linux:
     name: linux
     runs-on: ubuntu-latest
+    # checkout, plus zizmor's online audits (impostor commits, advisories).
+    permissions:
+      contents: read
     timeout-minutes: 30
     steps:
       # Nothing here pushes; keep the token out of .git/config.
@@ -147,8 +151,11 @@ jobs:
       # SHA really is a commit of the action's repository (impostor commits)
       # and that no pinned version has a known advisory. Pinned and
       # checksum-verified like actionlint; exits non-zero on any finding.
-      # The pedantic persona adds the code-quality audits the default one
-      # hides (unnamed jobs, ...); every one of them passes today.
+      # The auditor persona runs every audit at every confidence: the
+      # code-quality ones the default persona hides (unnamed jobs, ...) and
+      # the low-confidence ones pedantic still drops. Every one passes today.
+      # --strict-collection fails on a workflow zizmor cannot parse, which it
+      # otherwise only warns about and skips, auditing nothing in it.
       - name: zizmor
         env:
           ZIZMOR_VERSION: 1.32.0
@@ -161,7 +168,7 @@ jobs:
           echo "${ZIZMOR_SHA256}  ${tarball}" | sha256sum -c -
           tar xzf "${tarball}" zizmor
           cd "${GITHUB_WORKSPACE}"
-          "${RUNNER_TEMP}/zizmor" --color=always --persona=pedantic .github/workflows
+          "${RUNNER_TEMP}/zizmor" --color=always --persona=auditor --strict-collection .github/workflows
 
       # Fast, needs no build: keep the clean packages clean. load_probe.rs is
       # checked by itself, since the rest of victory-loader is not clean yet.
@@ -222,6 +229,9 @@ jobs:
   windows-target-check:
     name: windows-target-check
     runs-on: ubuntu-latest
+    # checkout only.
+    permissions:
+      contents: read
     timeout-minutes: 30
     env:
       # blake3's build script compiles C/assembly with MSVC tools for this
