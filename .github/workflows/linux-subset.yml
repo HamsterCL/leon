@@ -92,32 +92,37 @@ jobs:
         run: cargo xtask policy
 
       # Lints all workflows: expression and context typos, unknown keys, and
-      # (via the runner's preinstalled shellcheck) the `run:` scripts, which
-      # YAML parsing alone never checks. The release is pinned and its
-      # checksum verified, like the actions above.
-      # actionlint silently skips the shell checks when shellcheck is not on
-      # PATH, so a runner image without it would pass every `run:` script
-      # unchecked. Fail instead, and pass the binary explicitly so the check
-      # cannot be dropped by a PATH change. pyflakes is off: no step runs Python.
+      # (via ShellCheck) the `run:` scripts, which YAML parsing alone never
+      # checks. actionlint silently skips the shell checks when shellcheck is
+      # not on PATH, and the runner image's shellcheck changes version under
+      # us, so a pinned ShellCheck release is downloaded and passed explicitly
+      # instead: the same checks run on every runner image, and a missing
+      # binary fails the step rather than skipping the checks. Both releases
+      # are pinned and their checksums verified, like the actions above.
+      # pyflakes is off: no step runs Python.
       # SHELLCHECK_OPTS turns on ShellCheck's optional checks (masked return
       # codes, `set -e` suppressed in functions, unassigned uppercase vars,
-      # `[[ ]]` over `[ ]`, `${var}` over `$var`, ...) for the `run:` scripts.
-      # Every optional check is listed and passes; they are named rather than
-      # `--enable=all` so a newer runner shellcheck cannot add one unseen.
+      # `[[ ]]` over `[ ]`, `${var}` over `$var`, useless `cat`, ...) for the
+      # `run:` scripts. Every optional check of the pinned release is listed
+      # and passes (`shellcheck --list-optional`); they are named rather than
+      # `--enable=all` so bumping ShellCheck cannot add one unseen.
       - name: actionlint
         env:
           SHELLCHECK_OPTS: >-
-            --enable=add-default-case,avoid-nullary-conditions,check-extra-masked-returns,check-set-e-suppressed,check-unassigned-uppercase,deprecate-which,quote-safe-variables,require-double-brackets,require-variable-braces
+            --enable=add-default-case,avoid-negated-conditions,avoid-nullary-conditions,check-extra-masked-returns,check-set-e-suppressed,check-unassigned-uppercase,deprecate-which,quote-safe-variables,require-double-brackets,require-variable-braces,useless-use-of-cat
+          SHELLCHECK_VERSION: 0.11.0
+          SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
           ACTIONLINT_VERSION: 1.7.7
           ACTIONLINT_SHA256: 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
         run: |
-          if ! shellcheck_bin="$(command -v shellcheck)"; then
-            echo "::error::shellcheck is not installed; actionlint would skip the run: scripts"
-            exit 1
-          fi
+          cd "${RUNNER_TEMP}"
+          sc_tarball="shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl -sSfL --retry 3 -O "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/${sc_tarball}"
+          echo "${SHELLCHECK_SHA256}  ${sc_tarball}" | sha256sum -c -
+          tar xJf "${sc_tarball}" --strip-components=1 "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+          shellcheck_bin="${RUNNER_TEMP}/shellcheck"
           "${shellcheck_bin}" --version
           tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
-          cd "${RUNNER_TEMP}"
           curl -sSfL --retry 3 -O "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
           echo "${ACTIONLINT_SHA256}  ${tarball}" | sha256sum -c -
           tar xzf "${tarball}" actionlint
