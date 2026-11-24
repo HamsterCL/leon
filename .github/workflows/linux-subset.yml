@@ -438,3 +438,18 @@ jobs:
       # is not rustfmt-clean on main yet, so it is not checked here.)
       - name: rustfmt (hle-probe fixture)
         run: cargo fmt --check --manifest-path tests/fixtures/hle-probe/Cargo.toml
+
+      # As in the linux job: the Windows-target builds (the workspace's and the
+      # hle-probe fixture's, build scripts included) must leave the checkout as
+      # they found it. Ignored output (target/, the fixture's target/) does not
+      # count; anything else, tracked or untracked, fails. The fixture's
+      # --locked steps already cover its own Cargo.lock.
+      - name: Checkout unchanged by the steps above
+        run: |
+          changes="$(git status --porcelain=v1 --untracked-files=all)"
+          if [[ -n "${changes}" ]]; then
+            echo "::error::the steps above modified or created files in the checkout" >&2
+            printf '%s\n' "${changes}" >&2
+            git diff --stat >&2
+            exit 1
+          fi
