@@ -37,12 +37,17 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// Creates the host device now, which also fixes the Wave64 lowering this
-/// host wants. A translation made before that would not be the one the
-/// title's first use makes, and would be cached under the wrong key.
+/// Creates the host device now, which also tells the translator what the
+/// host allows (its widest wave, the view heap limit). A translation made
+/// before that would not be the one the title's first use makes, and would
+/// be cached under the same key.
 #[cfg(windows)]
 pub fn prepare_host() -> bool {
-    crate::host::host().is_some()
+    if crate::host::host().is_none() {
+        return false;
+    }
+    crate::descriptor::host::probe_view_limit();
+    true
 }
 
 /// Translates one container into the cache as the title's first use would,
@@ -50,14 +55,9 @@ pub fn prepare_host() -> bool {
 /// already (`false`). Without a cache folder it is an error.
 pub fn prewarm(container: &[u8]) -> Result<bool, String> {
     let cache = CACHE.get().ok_or("no shader cache folder")?;
-    let wave64 = effective_wave64_mode();
-    let options = TranslateOptions { wave64 };
-    let mb = [mode_byte(wave64)];
-    let input = [&build()[..], &mb[..], container].concat();
+    let input = [&build()[..], container].concat();
     let converter = Translate {
-        translate: |c: &[u8]| {
-            victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string())
-        },
+        translate: |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string()),
         ran: AtomicBool::new(false),
     };
     cache
