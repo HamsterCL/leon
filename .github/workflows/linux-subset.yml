@@ -249,20 +249,47 @@ jobs:
       # too: `<<<<<<< `, `||||||| ` or `>>>>>>> ` opening a line in any
       # tracked text file. A bare `=======` is left alone; it is also a
       # Markdown heading underline.
-      - name: LF line endings, no conflict markers
+      # Trailing spaces or tabs, and a last line with no newline, are clean
+      # everywhere on main too, but only the rustfmt-clean packages are
+      # checked by rustfmt; the rest (workflows, TOML, docs, the crates
+      # rustfmt skips) pick up whitespace-only diff noise unseen. Both are
+      # read from the index (`git grep --cached`, the `--eol` list), so a
+      # CRLF working-tree copy (*.cmd, *.ps1) cannot trip or hide either.
+      - name: LF line endings, no conflict markers, no stray whitespace
         run: |
           list="${RUNNER_TEMP}/eol"
           git ls-files -z --eol > "${list}"
           bad=()
+          no_final_newline=()
           while IFS= read -r -d '' entry; do
             index_eol="${entry%% *}"
+            path="${entry#*$'\t'}"
             if [[ "${index_eol}" == i/crlf || "${index_eol}" == i/mixed ]]; then
-              bad+=("${entry#*$'\t'}")
+              bad+=("${path}")
+            fi
+            # i/-text is binary; an empty file has nothing to end.
+            if [[ "${index_eol}" != i/-text ]]; then
+              last="$(git cat-file blob ":${path}" | tail -c 1)"
+              if [[ -n "${last}" ]]; then
+                no_final_newline+=("${path}")
+              fi
             fi
           done < "${list}"
           if [[ "${#bad[@]}" -ne 0 ]]; then
             echo "::error::tracked files stored with CRLF line endings (re-add them with git add --renormalize)" >&2
             printf '%s\n' "${bad[@]}" >&2
+            exit 1
+          fi
+          if [[ "${#no_final_newline[@]}" -ne 0 ]]; then
+            echo "::error::tracked text files whose last line has no newline" >&2
+            printf '%s\n' "${no_final_newline[@]}" >&2
+            exit 1
+          fi
+          # git grep exits 1 when nothing matches; any other failure stops.
+          trailing="$(git grep --cached -nIE -e '[[:blank:]]+$')" || [[ $? -eq 1 ]]
+          if [[ -n "${trailing}" ]]; then
+            echo "::error::trailing spaces or tabs in tracked files" >&2
+            printf '%s\n' "${trailing}" >&2
             exit 1
           fi
           # git grep exits 1 when nothing matches; any other failure stops.
