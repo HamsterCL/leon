@@ -9493,7 +9493,7 @@ mod tests {
             code,
         };
         let p = ir::build(&native.code, false, 256).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
         lower(&Parts {
@@ -9534,7 +9534,7 @@ mod tests {
         ];
         for op in ops {
             let words: Vec<u32> = head.iter().chain(&[op]).chain(&tail).copied().collect();
-            lowers(&words).unwrap();
+            lowers(&words, 0).unwrap();
         }
     }
 
@@ -9553,7 +9553,7 @@ mod tests {
                 0xBE83_0380,           // s_mov_b32 s3, 0
                 S_ENDPGM,
             ];
-            lowers(&words).unwrap_or_else(|e| panic!("SOP1 {op:#x}: {e}"));
+            lowers(&words, 0).unwrap_or_else(|e| panic!("SOP1 {op:#x}: {e}"));
         }
         // The zero counts also leave "result != 0" in SCC.
         for op in [0x0D, 0x0E] {
@@ -9565,7 +9565,7 @@ mod tests {
                 0xBE83_0380,           // s_mov_b32 s3, 0
                 S_ENDPGM,
             ];
-            lowers(&words).unwrap_or_else(|e| panic!("SOP1 {op:#x} SCC: {e}"));
+            lowers(&words, 0).unwrap_or_else(|e| panic!("SOP1 {op:#x} SCC: {e}"));
         }
     }
 
@@ -9602,7 +9602,7 @@ mod tests {
             0xBE86_0300, // s_mov_b32 s6, s0
             S_ENDPGM,
         ];
-        lowers(&static_rels).unwrap();
+        lowers(&static_rels, 0).unwrap();
 
         // 2. s_movrels_b32 with dynamic M0
         let dynamic_rels = [
@@ -9614,7 +9614,7 @@ mod tests {
             0xBE86_0300, // s_mov_b32 s6, s0
             S_ENDPGM,
         ];
-        lowers(&dynamic_rels).unwrap();
+        lowers(&dynamic_rels, 0).unwrap();
 
         // 3. s_movreld_b32 with static M0 followed by readback
         let static_reld = [
@@ -9625,7 +9625,7 @@ mod tests {
             0xBE80_0306, // s_mov_b32 s0, s6
             S_ENDPGM,
         ];
-        lowers(&static_reld).unwrap();
+        lowers(&static_reld, 0).unwrap();
 
         // 4. s_movreld_b32 with dynamic M0 followed by readback
         let dynamic_reld = [
@@ -9637,7 +9637,7 @@ mod tests {
             0xBE80_0306, // s_mov_b32 s0, s6
             S_ENDPGM,
         ];
-        lowers(&dynamic_reld).unwrap();
+        lowers(&dynamic_reld, 0).unwrap();
 
         // 5. Out-of-bounds M0 offsets (static & dynamic) clamp cleanly to 0 / no-op
         let oob_rels = [
@@ -9649,7 +9649,7 @@ mod tests {
             0xBE86_0300, // s_mov_b32 s6, s0
             S_ENDPGM,
         ];
-        lowers(&oob_rels).unwrap();
+        lowers(&oob_rels, 0).unwrap();
     }
 
     #[test]

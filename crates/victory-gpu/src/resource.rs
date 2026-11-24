@@ -894,7 +894,6 @@ fn host_texture(
     // B4G4R4A4_UNORM = 115) with RENDER_TARGET or UNORDERED_ACCESS, which
     // turns every view into a null descriptor. Store them as R16_TYPELESS
     // (same 16 bpp) so the host texture exists.
-    const RENDER_TARGET: u32 = 1;
     const R16_TYPELESS: u32 = 53;
     const R16_UNORM: u32 = 56;
     let packed16_fallback =

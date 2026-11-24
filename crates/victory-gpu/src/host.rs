@@ -1697,9 +1697,9 @@ impl Host {
         unsafe {
             let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
             handle.ptr += (slot * self.rtv_size) as usize;
-            let res_desc = resource.GetDesc();
+            let res_desc = resource.map(|r| r.GetDesc());
             let mut patched = desc.copied();
-            if res_desc.Format == DXGI_FORMAT_R16_TYPELESS {
+            if res_desc.is_some_and(|r| r.Format == DXGI_FORMAT_R16_TYPELESS) {
                 let d = patched.get_or_insert_with(|| D3D12_RENDER_TARGET_VIEW_DESC {
                     Format: DXGI_FORMAT_R16_UNORM,
                     ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,

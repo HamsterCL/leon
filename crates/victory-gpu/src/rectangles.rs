@@ -429,6 +429,8 @@ float read_comp(uint kind, uint pos) {
     if (kind == 0u) return asfloat(load_u32(pos));
     if (kind == 1u) return half_to_f32(load_u16(pos));
     if (kind == 2u) return (float)load_u16(pos) / 65535.0f;
+    if (kind == 4u) return max((float)(int)(load_u16(pos) << 16u >> 16u | ((load_u16(pos) & 0x8000u) != 0u ? 0xffff0000u : 0u)) / 32767.0f, -1.0f);
+    if (kind == 5u) return max((float)(int)(load_u8(pos) | ((load_u8(pos) & 0x80u) != 0u ? 0xffffff00u : 0u)) / 127.0f, -1.0f);
     return (float)load_u8(pos) / 255.0f;
 }
 
@@ -439,6 +441,10 @@ void write_comp(uint kind, uint pos, float v) {
         store_u16(pos, f32_to_half(v));
     } else if (kind == 2u) {
         store_u16(pos, (uint)(saturate(v) * 65535.0f + 0.5f));
+    } else if (kind == 4u) {
+        store_u16(pos, (uint)(int)round(clamp(v, -1.0f, 1.0f) * 32767.0f) & 0xffffu);
+    } else if (kind == 5u) {
+        store_u8(pos, (uint)(int)round(clamp(v, -1.0f, 1.0f) * 127.0f) & 0xffu);
     } else {
         store_u8(pos, (uint)(saturate(v) * 255.0f + 0.5f));
     }
@@ -473,7 +479,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
             uint offset = desc.x;
             uint kind = desc.y & 0xffu;
             uint comp_count = desc.y >> 8u;
-            uint comp_bytes = kind == 0u ? 4u : (kind == 3u ? 1u : 2u);
+            uint comp_bytes = kind == 0u ? 4u : ((kind == 3u || kind == 5u) ? 1u : 2u);
             for (uint c = 0u; c < comp_count; c++) {
                 uint at = offset + c * comp_bytes;
                 float a = read_comp(kind, v0_src + at);

@@ -182,7 +182,7 @@ unsafe fn open_adapter(adapter: &IDXGIAdapter1, name: String, warp: bool) -> Opt
             warp,
             wave_min: opts1.WaveLaneCountMin,
             wave_max: opts1.WaveLaneCountMax,
-            host: Host { device },
+            host: Host::from_device(device, warp),
         })
     }
 }

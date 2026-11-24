@@ -7553,6 +7553,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_subfolder_taken_by_a_named_pipe_or_a_socket_is_an_error_without_blocking() {
         // Scratch folder under the system temp folder, removed when dropped.

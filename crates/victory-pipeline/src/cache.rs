@@ -194,7 +194,8 @@ mod tests {
                         .share_mode(1)
                         .open(&path)?,
                 );
-                let probe = tempfile_in(path.parent().unwrap());
+                let (probe, probe_file) = tempfile_in(path.parent().unwrap())?;
+                drop(probe_file);
                 std::fs::write(&probe, &output)?;
                 assert!(
                     std::fs::rename(&probe, &path).is_err(),

@@ -706,9 +706,9 @@ extern "system" fn copy_texture_region(
                 return;
             };
             if crate::texture::title_written(from_tex) {
-                crate::texture::upload(list, src.resource, from_tex);
+                crate::texture::upload(&list, src.resource, from_tex);
             }
-            ensure_state(list, src.resource, COPY_SOURCE);
+            ensure_state(&list, src.resource, COPY_SOURCE);
             let mut to_location = dst;
             to_location.resource = buffer.as_raw().cast_const().cast();
             to_location.footprint.offset = 0;
@@ -2172,14 +2172,14 @@ mod tests {
         discard(list, null, null.cast());
         discard(list, buffer, null.cast());
         ensure_state(
-            host_list,
+            &host_list,
             srv,
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32,
         );
         discard(list, srv, null.cast());
         discard(list, rt, null.cast()); // no state established by this list yet
 
-        ensure_state(host_list, rt, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
+        ensure_state(&host_list, rt, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
         discard(list, rt, null.cast());
         let rect = Rect {
             left: 1,
@@ -2204,7 +2204,7 @@ mod tests {
             slot::<extern "system" fn(This, u64, *const [f32; 4], u32, *const Rect)>(list, 0x1a0);
         clear(list, handle, &[0.25, 0.5, 0.75, 1.0], 0, std::ptr::null());
 
-        ensure_state(host_list, ds, D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32);
+        ensure_state(&host_list, ds, D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32);
         for first_subresource in [0, 1] {
             discard(
                 list,
@@ -2218,7 +2218,7 @@ mod tests {
             );
         }
         ensure_state(
-            host_list,
+            &host_list,
             uav,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32,
         );

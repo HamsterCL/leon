@@ -676,7 +676,7 @@ mod tests {
         };
         let refusal = |native: &NativeProgram| {
             let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-            let res = resource::track(&p, &native.layout, native.stage).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
             let io = io::raise(&p, native).unwrap();
             let st = structure::structure(&p).unwrap();
             let container = crate::dxbc::build(&[]);

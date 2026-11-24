@@ -102,6 +102,8 @@ impl Kind {
             Kind::F16 => 1,
             Kind::Unorm16 => 2,
             Kind::Unorm8 => 3,
+            Kind::Snorm16 => 4,
+            Kind::Snorm8 => 5,
         }
     }
 

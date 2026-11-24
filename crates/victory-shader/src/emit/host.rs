@@ -138,6 +138,11 @@ impl Host {
             .then(|| WARP_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
+    /// A host over an already created device.
+    pub(crate) fn from_device(device: ID3D12Device, warp: bool) -> Self {
+        Host { device, warp }
+    }
+
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp
