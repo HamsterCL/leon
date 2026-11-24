@@ -359,6 +359,70 @@ jobs:
             exit 1
           fi
 
+      # Path names that a Linux checkout accepts and a Windows one cannot
+      # hold. NTFS is case-insensitive, so two tracked paths that differ only
+      # in case (`Foo.rs`, `foo.rs`) collapse into one file there and the
+      # checkout shows a permanent spurious change. Windows also refuses a
+      # path component that holds `< > : " | ? *`, a backslash or a control
+      # character, that ends in a dot or a space, or whose name before the
+      # first dot is a reserved device (CON, PRN, AUX, NUL, COM0-9, LPT0-9,
+      # any case): `git checkout` there fails outright. Read from the index,
+      # NUL-delimited, so no name can split; the comparison runs under the
+      # C locale so it folds ASCII case only, as the check is meant to.
+      - name: Portable file names
+        env:
+          LC_ALL: C
+        run: |
+          list="${RUNNER_TEMP}/names"
+          git ls-files -z > "${list}"
+          bad=()
+          declare -A seen=()
+          collide=()
+          reserved='^(con|prn|aux|nul|com[0-9]|lpt[0-9])$'
+          while IFS= read -r -d '' path; do
+            # Walk every prefix (each directory, then the file), so `Src/a`
+            # and `src/b` collide too, not only whole paths.
+            prefix=""
+            rest="${path}"
+            flagged=0
+            while [[ -n "${rest}" ]]; do
+              part="${rest%%/*}"
+              if [[ "${rest}" == */* ]]; then
+                rest="${rest#*/}"
+              else
+                rest=""
+              fi
+              prefix="${prefix:+${prefix}/}${part}"
+              lower="${prefix,,}"
+              if [[ -z "${seen[${lower}]+set}" ]]; then
+                seen["${lower}"]="${prefix}"
+              elif [[ "${seen[${lower}]}" != "${prefix}" ]]; then
+                collide+=("${seen[${lower}]} <-> ${prefix}")
+              fi
+              stem="${part%%.*}"
+              if [[ "${flagged}" -eq 0 ]] \
+                && { [[ "${part}" =~ [\<\>:\"\|?*\\[:cntrl:]] ]] \
+                  || [[ "${part}" == *. || "${part}" == *' ' ]] \
+                  || [[ "${stem,,}" =~ ${reserved} ]]; }; then
+                bad+=("${path}")
+                flagged=1
+              fi
+            done
+          done < "${list}"
+          failed=0
+          if [[ "${#collide[@]}" -ne 0 ]]; then
+            echo "::error::tracked paths that differ only in case (one file on Windows)" >&2
+            printf '%s\n' "${collide[@]}" | sort -u >&2
+            failed=1
+          fi
+          if [[ "${#bad[@]}" -ne 0 ]]; then
+            echo "::error::tracked paths Windows cannot check out (reserved name, character, or trailing dot or space)" >&2
+            printf '%s\n' "${bad[@]}" >&2
+            failed=1
+          fi
+          if [[ "${failed}" -ne 0 ]]; then
+            exit 1
+          fi
       # Lints all workflows: expression and context typos, unknown keys, and
       # (via ShellCheck) the `run:` scripts, which YAML parsing alone never
       # checks. actionlint silently skips the shell checks when shellcheck is
