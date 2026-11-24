@@ -77,9 +77,13 @@ jobs:
   # Each job's name repeats its id, so the check names that branch protection
   # requires stay `linux` and `windows-target-check`; zizmor's auditor
   # persona (below) flags unnamed jobs.
+  # Both jobs pin the runner image's Ubuntu release rather than
+  # `ubuntu-latest`, like the action and tool pins: the alias moves to a new
+  # release (new preinstalled rustup, curl, tar, coreutils, ...) under us, so
+  # a passing PR could fail on main with no change. Bump it deliberately.
   linux:
     name: linux
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # checkout, plus zizmor's online audits (impostor commits, advisories).
     permissions:
       contents: read
@@ -228,7 +232,7 @@ jobs:
   # above never compiles.
   windows-target-check:
     name: windows-target-check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # checkout only.
     permissions:
       contents: read
