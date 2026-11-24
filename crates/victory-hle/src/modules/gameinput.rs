@@ -1349,7 +1349,7 @@ mod host {
             }
             // Neither can see a Switch Pro Controller; it takes the first
             // slot they left empty.
-            if pad.is_none() && self.taken.iter().position(|&t| !t) == Some(slot) {
+            if pad.is_none() && self.taken[..slot].iter().all(|&t| t) {
                 pad = self.switch_pro.state();
             }
             self.taken[slot] = pad.is_some();

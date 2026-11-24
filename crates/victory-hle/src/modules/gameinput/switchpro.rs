@@ -195,6 +195,7 @@ mod host {
             tracing::warn!("Switch Pro Controller refused its report mode; reading as it is");
         }
         let mut report = [0_u8; READ_LEN];
+        let mut pressed = false;
         loop {
             let mut got = 0_u32;
             // SAFETY: room for `READ_LEN` bytes; no overlap, so it blocks.
@@ -211,6 +212,10 @@ mod host {
                 return;
             }
             if let Some(pad) = parse(&report[..got as usize]) {
+                if !pressed && pad != PadState::default() {
+                    pressed = true;
+                    tracing::info!(buttons = pad.buttons, "Switch Pro Controller input");
+                }
                 set(state, Some(pad));
             }
         }
