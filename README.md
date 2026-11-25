@@ -242,7 +242,8 @@ victory census [paths...] [--missing] [--strict]
 victory lib-exports <import.lib> [--list]
 victory shader-info [paths...] [--verbose] [--disasm]
 victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
-victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
+victory prewarm [paths...] [--jobs N]
+victory run <exe> [--execute] [--prewarm] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
 victory config
 ```
@@ -250,8 +251,18 @@ victory config
 `translate --jobs N` requires a positive worker count. Omit it to use the
 default worker count.
 
+`prewarm` puts the game's shaders (default: `shaders.rpf` of the configured
+game) through the translator into the shader cache a run uses, so the first
+use finds them there; `run --prewarm` does it first and then runs. Progress
+goes to the log, a line every two seconds. A rebuilt `victory.exe` has its own
+cache entries, so prewarm again after building.
+
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
-info and above).
+info and above). `VICTORY_LOGS=1` shows the log in a console of its own;
+`VICTORY_LOGS=0` turns it off and hides that console. The log is also kept in
+`%LOCALAPPDATA%\victory\logs` (`VICTORY_LOG_DIR` names another folder), one
+`victory-<time>-<pid>.log` per process, the last ten. Local setup notes for
+an NVIDIA card and a Switch Pro pad: [docs/guia-local-nvidia.md](docs/guia-local-nvidia.md).
 
 Host drivers that crash compiling a shader: with `VICTORY_PIPELINE_JOURNAL=1`
 a pipeline whose creation ends the process is refused from the next run on
