@@ -1,8 +1,8 @@
 //! `victory prewarm`: the shaders go through the translator before a run, so
 //! the title's first use finds them in the cache (decision 0003). Progress
-//! shows in the console and in its title bar.
+//! goes to the log, a line every couple of seconds, so it shows in the
+//! console (`VICTORY_LOGS=1`) and in the log file.
 
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -11,8 +11,8 @@ use anyhow::{Context, Result, bail};
 
 use crate::shader::{MAX_FILE, sources};
 
-/// How often the progress line changes.
-const REFRESH: Duration = Duration::from_millis(250);
+/// How often a progress line goes to the log.
+const REFRESH: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 struct Counts {
@@ -72,7 +72,7 @@ pub fn translate(
         }
         let data = std::fs::read(&file).with_context(|| file.display().to_string())?;
         let found = sources(&data);
-        println!(
+        tracing::info!(
             "{}: {} shader containers, {jobs} threads",
             file.display(),
             found.len()
@@ -101,16 +101,12 @@ pub fn translate(
                 });
             }
             while counts.done.load(Ordering::Relaxed) < found.len() {
-                let text = line(&counts, found.len(), started);
-                // The console title shows it too, with the window in the back.
-                print!("\x1b]0;VIctory: {text}\x07\r{text}   ");
-                let _ = std::io::stdout().flush();
+                tracing::info!("{}", line(&counts, found.len(), started));
                 std::thread::sleep(REFRESH);
             }
         });
-        let text = line(&counts, found.len(), started);
-        println!("\x1b]0;VIctory: shaders ready\x07\r{text}   ");
+        tracing::info!("{}", line(&counts, found.len(), started));
     }
-    println!("done: a run now finds these translations in the cache");
+    tracing::info!("shaders ready: a run now finds these translations in the cache");
     Ok(())
 }
